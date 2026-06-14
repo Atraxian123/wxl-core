@@ -332,7 +332,7 @@ namespace
     // ---- per-draw bone splitter ----------------------------------------------------------------------
     // A modern .skin can declare a submesh whose per-draw bone palette (boneCombos[boneComboIndex ..
     // +boneCount)) exceeds 75. Split each such drawn submesh into N sub-sections of <=75 unique bones, 
-    // each with its own compact boneCombos slice, like the WotLK exporter's skin partitioner. 
+    // each with its own compact boneCombos slice, like the Client exporter's skin partitioner. 
     //
     // The skin geometry arrays (vertexLookup, indices, bones) and header.boneCombos are rebuilt into owned 
     // buffers.
