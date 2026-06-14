@@ -4,9 +4,11 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 #include <vector>
 
 namespace sdk = wraith::m2;
@@ -318,15 +320,273 @@ namespace
     }
 
     // SM3 vertex-constant ceiling: the bone palette starts at c31, 3 registers per bone matrix, so
-    // (256 - 31) / 3 = 75 bones per draw.
-    // staging buffer and corrupts the adjacent state-descriptor table (ERROR #132).
+    // (256 - 31) / 3 = 75 bones per draw. The splitter keeps every drawn section under this; the FixSubmeshes
+    // clamp is the safety net when a split is skipped or impossible.
     constexpr uint16_t kMaxBonesPerDraw = 75;
 
-    // A level>0 submesh is a (level<<16|id) sub-batch the 264 engine cannot draw. Park it by zeroing its
-    // geometry and marking badSubmesh so its batch is skipped, but KEEP boneCount/boneInfluences intact:
-    // native FinalizeSkin divides boneCountMax by every submesh boneCount (parked or not), so a zeroed
-    // boneCount is a divide-by-zero. A drawn (level 0) submesh gets boneCount clamped to the SM3 ceiling
-    // and to the boneCombos array bounds (>=1), plus a >=1 bone-influence floor.
+    // A skin->batchCount/submeshCount past this is treated as malformed; the env split can up to double the
+    // batch count and the splitter grows submeshes, so cap the commit well under any value that would
+    // overflow the native +0x188 sizing (batchCount*4).
+    constexpr uint32_t kMaxBatches = 0x4000;
+
+    // ---- per-draw bone splitter ----------------------------------------------------------------------
+    // A modern .skin can declare a submesh whose per-draw bone palette (boneCombos[boneComboIndex ..
+    // +boneCount)) exceeds 75. Split each such drawn submesh into N sub-sections of <=75 unique bones, 
+    // each with its own compact boneCombos slice, like the WotLK exporter's skin partitioner. 
+    //
+    // The skin geometry arrays (vertexLookup, indices, bones) and header.boneCombos are rebuilt into owned 
+    // buffers.
+    //
+    // Skinning model: skin.indices[] are GLOBAL local-vertex indices
+    // into vertexLookup, range [section.vertexStart, +vertexCount); the GPU index builder subtracts
+    // vertexStart. skin.bones[localVertex] (uint8[4]) holds LOCAL indices into the section's boneCombos
+    // slice; header.boneCombos[section.boneComboIndex + bones[k]] = the global bone, and bones[k] is the
+    // on-GPU vertex bone index the c31 palette is addressed by. So a sub-section needs: its own boneCombos
+    // slice of the unique global bones its triangles touch, each vertex's bones[] remapped to that slice,
+    // and its own contiguous vertex/index range (shared vertices are duplicated per sub-section).
+
+    // u16 ceilings of the skin format: vertexStart/Count, indexStart/Count and every index value are u16.
+    constexpr uint32_t kSkinU16Max = 0xFFFF;
+
+    // Upper bound on boneCombos count; a source above this is rejected before the bulk copy.
+    constexpr uint32_t kSplitMaxBoneCombos = 0x10000;
+
+    // One rebuilt sub-section plus the original submesh it came from (so its batches can be re-pointed).
+    struct SplitSection
+    {
+        sdk::M2SkinSection section;
+        uint16_t           origSubmesh;
+    };
+
+    // The contiguous run of new sub-section indices one original submesh became.
+    struct SplitRun { uint16_t first; uint16_t count; };
+
+    // Greedy triangle bin-packer. Accumulate triangles into the current sub-section while the union of
+    // unique global bones their vertices reference stays <= 75; otherwise start a new sub-section. Each
+    // sub-section emits a compact boneCombos slice (sorted unique globals), a deduplicated vertex block
+    // with remapped bones[], and a global-indexed triangle block. splitMap[origSubmesh] = the run of new
+    // section indices it became. Returns false (no commit) if any rebuilt count would overflow a u16 field,
+    // leaving the caller on the clamp path.
+    bool SplitSubmeshes(sdk::M2Header* md, sdk::M2SkinProfile* skin, std::vector<SplitSection>& outSections,
+                        std::vector<SplitRun>& splitMap, uint32_t& splitCount, const char* name)
+    {
+        if (!md->boneCombos.count || !md->boneCombos.offset) return false;
+        if (!skin->vertexLookup || !skin->indices || !skin->bones) return false;
+
+        // Header M2Arrays are de-relocated by model init before the skin is finalized, so .offset already
+        // holds a raw pointer here.
+        uint32_t boneComboCount = md->boneCombos.count;
+        auto* boneCombos = reinterpret_cast<uint16_t*>(md->boneCombos.offset);
+        if (boneComboCount > kSplitMaxBoneCombos || !boneCombos)
+        {
+            WLOG_WARN("MD21: '%s' boneCombos count=%u ptr=%p out of range, skipping bone split", name,
+                      boneComboCount, boneCombos);
+            return false;
+        }
+
+        std::vector<uint16_t> newVtxLookup;
+        std::vector<uint8_t>  newBones;          // 4 bytes per new local vertex
+        std::vector<uint16_t> newIndices;
+        std::vector<uint16_t> newBoneCombos(boneCombos, boneCombos + boneComboCount);
+        newVtxLookup.reserve(skin->vertexCount);
+        newBones.reserve(skin->vertexCount * 4);
+        newIndices.reserve(skin->indexCount);
+
+        splitCount = 0;
+
+        for (uint32_t si = 0; si < skin->submeshCount; ++si)
+        {
+            sdk::M2SkinSection src = skin->submeshes[si];
+
+            // A level>0 submesh is a (level<<16|id) sub-batch the 264 engine cannot draw. Pass it through as
+            // a single zeroed placeholder so the batch re-point stays 1:1; its batch is later skipped.
+            if (src.level > 0)
+            {
+                src.level = 0; src.vertexStart = 0; src.vertexCount = 0; src.indexStart = 0;
+                src.indexCount = 0; src.boneComboIndex = 0; src.centerBoneIndex = 0; src.boneCount = 1;
+                reinterpret_cast<uint8_t*>(&src)[0x11] = 0;
+                outSections.push_back({ src, static_cast<uint16_t>(si) });
+                continue;
+            }
+
+            // Bound the section index window to the live skin index buffer before the triangle walk derefs
+            // skin->indices[src.indexStart + t*3 + k].
+            if (static_cast<uint32_t>(src.indexStart) + src.indexCount > skin->indexCount)
+            {
+                WLOG_WARN("MD21: '%s' submesh %u index window [%u,+%u) past skin indexCount %u, skipping "
+                          "bone split", name, si, src.indexStart, src.indexCount, skin->indexCount);
+                return false;
+            }
+
+            uint32_t triCount = src.indexCount / 3;
+            uint32_t comboBase = src.boneComboIndex;
+
+            // Walk triangles, packing into sub-sections.
+            std::vector<uint16_t> curGlobals;    // unique global bones in the current sub-section
+            uint32_t curTriStart = 0;
+            uint32_t emittedSections = 0;
+
+            auto emit = [&](uint32_t triFrom, uint32_t triTo, std::vector<uint16_t>& globals) -> bool
+            {
+                if (triFrom >= triTo) return true;
+                // sort globals for a stable compact slice, build global->local map
+                std::sort(globals.begin(), globals.end());
+                uint32_t comboIndex = static_cast<uint32_t>(newBoneCombos.size());
+                if (comboIndex > kSkinU16Max) return false;
+                for (uint16_t g : globals) newBoneCombos.push_back(g);
+
+                uint32_t secVertStart = static_cast<uint32_t>(newVtxLookup.size());
+                uint32_t secIndexStart = static_cast<uint32_t>(newIndices.size());
+                if (secVertStart > kSkinU16Max || secIndexStart > kSkinU16Max) return false;
+
+                // dedup vertices within this sub-section
+                std::unordered_map<uint16_t, uint16_t> vmap;
+                for (uint32_t t = triFrom; t < triTo; ++t)
+                {
+                    for (uint32_t k = 0; k < 3; ++k)
+                    {
+                        uint16_t lv = skin->indices[src.indexStart + t * 3 + k];
+                        if (lv >= skin->vertexCount) return false;   // bad index -> abort, fall to clamp
+                        auto it = vmap.find(lv);
+                        uint16_t nv;
+                        if (it == vmap.end())
+                        {
+                            uint32_t idx = static_cast<uint32_t>(newVtxLookup.size());
+                            if (idx > kSkinU16Max) return false;
+                            nv = static_cast<uint16_t>(idx);
+                            vmap.emplace(lv, nv);
+                            newVtxLookup.push_back(skin->vertexLookup[lv]);
+                            const uint8_t* infl = skin->bones + lv * 4;
+                            for (uint32_t j = 0; j < 4; ++j)
+                            {
+                                uint32_t comboIdx = comboBase + infl[j];
+                                uint16_t g = comboIdx < boneComboCount ? boneCombos[comboIdx] : globals[0];
+                                // local index in this sub-section's sorted slice
+                                auto lo = std::lower_bound(globals.begin(), globals.end(), g);
+                                uint16_t local = (lo != globals.end() && *lo == g)
+                                               ? static_cast<uint16_t>(lo - globals.begin()) : 0;
+                                newBones.push_back(static_cast<uint8_t>(local));
+                            }
+                        }
+                        else nv = it->second;
+                        newIndices.push_back(nv);
+                    }
+                }
+
+                uint32_t secVertCount = static_cast<uint32_t>(newVtxLookup.size()) - secVertStart;
+                uint32_t secIndexCount = static_cast<uint32_t>(newIndices.size()) - secIndexStart;
+                if (secVertCount > kSkinU16Max || secIndexCount > kSkinU16Max) return false;
+
+                sdk::M2SkinSection sec = src;
+                sec.vertexStart    = static_cast<uint16_t>(secVertStart);
+                sec.vertexCount    = static_cast<uint16_t>(secVertCount);
+                sec.indexStart     = static_cast<uint16_t>(secIndexStart);
+                sec.indexCount     = static_cast<uint16_t>(secIndexCount);
+                sec.boneCount      = static_cast<uint16_t>(globals.size());
+                sec.boneComboIndex = static_cast<uint16_t>(comboIndex);
+                outSections.push_back({ sec, static_cast<uint16_t>(si) });
+                ++emittedSections;
+                return true;
+            };
+
+            for (uint32_t t = 0; t < triCount; ++t)
+            {
+                uint16_t g[12]; int gn = 0;
+                for (uint32_t k = 0; k < 3; ++k)
+                {
+                    uint16_t lv = skin->indices[src.indexStart + t * 3 + k];
+                    if (lv >= skin->vertexCount) return false;   // bad index -> abort, fall to clamp
+                    const uint8_t* infl = skin->bones + lv * 4;
+                    for (uint32_t j = 0; j < 4; ++j)
+                    {
+                        uint32_t comboIdx = comboBase + infl[j];
+                        uint16_t gg = comboIdx < boneComboCount ? boneCombos[comboIdx] : 0;
+                        bool seen = false;
+                        for (int e = 0; e < gn; ++e) if (g[e] == gg) { seen = true; break; }
+                        if (!seen && gn < 12) g[gn++] = gg;
+                    }
+                }
+                // union size if this triangle joined the current sub-section
+                size_t unionSize = curGlobals.size();
+                for (int e = 0; e < gn; ++e)
+                    if (std::find(curGlobals.begin(), curGlobals.end(), g[e]) == curGlobals.end())
+                        ++unionSize;
+
+                if (unionSize > kMaxBonesPerDraw && t > curTriStart)
+                {
+                    if (!emit(curTriStart, t, curGlobals)) return false;
+                    curGlobals.clear();
+                    curTriStart = t;
+                }
+                for (int e = 0; e < gn; ++e)
+                    if (std::find(curGlobals.begin(), curGlobals.end(), g[e]) == curGlobals.end())
+                        curGlobals.push_back(g[e]);
+            }
+            if (!emit(curTriStart, triCount, curGlobals)) return false;
+            if (emittedSections == 0)
+            {
+                // empty (degenerate) submesh: keep a placeholder section so batch re-point stays 1:1.
+                sdk::M2SkinSection sec = src;
+                sec.vertexCount = 0; sec.indexCount = 0; sec.boneCount = 1;
+                outSections.push_back({ sec, static_cast<uint16_t>(si) });
+            }
+            else if (emittedSections > 1)
+            {
+                splitCount += emittedSections - 1;
+            }
+        }
+
+        if (newVtxLookup.size() > kSkinU16Max || outSections.size() > kMaxBatches) return false;
+
+        // Build origSubmesh -> new-section run map (sections are emitted in original-submesh order, each as a
+        // contiguous run). Default each original to a 1:1 self-mapping so an absent origSubmesh stays valid.
+        splitMap.assign(skin->submeshCount, SplitRun{ 0, 0 });
+        for (uint16_t i = 0; i < outSections.size(); ++i)
+        {
+            uint16_t orig = outSections[i].origSubmesh;
+            if (orig >= splitMap.size()) continue;
+            if (splitMap[orig].count == 0) splitMap[orig].first = i;
+            ++splitMap[orig].count;
+        }
+
+        // Commit the rebuilt geometry into owned buffers (leaked for the model's lifetime, same pattern as
+        // the header arrays). skin->* were file-mapped; the engine never per-array frees them.
+        auto* vl = static_cast<uint16_t*>(malloc(newVtxLookup.size() * sizeof(uint16_t)));
+        auto* bn = static_cast<uint8_t*>(malloc(newBones.size()));
+        auto* ix = static_cast<uint16_t*>(malloc(newIndices.size() * sizeof(uint16_t)));
+        auto* bc = static_cast<uint16_t*>(malloc(newBoneCombos.size() * sizeof(uint16_t)));
+        auto* sm = static_cast<sdk::M2SkinSection*>(malloc(outSections.size() * sizeof(sdk::M2SkinSection)));
+        if (!vl || !bn || !ix || !bc || !sm)
+        {
+            free(vl); free(bn); free(ix); free(bc); free(sm);
+            return false;
+        }
+        memcpy(vl, newVtxLookup.data(), newVtxLookup.size() * sizeof(uint16_t));
+        memcpy(bn, newBones.data(), newBones.size());
+        memcpy(ix, newIndices.data(), newIndices.size() * sizeof(uint16_t));
+        memcpy(bc, newBoneCombos.data(), newBoneCombos.size() * sizeof(uint16_t));
+        for (size_t i = 0; i < outSections.size(); ++i) sm[i] = outSections[i].section;
+
+        skin->vertexLookup = vl;
+        skin->vertexCount  = static_cast<uint32_t>(newVtxLookup.size());
+        skin->bones        = bn;
+        skin->boneCount    = static_cast<uint32_t>(newVtxLookup.size());
+        skin->indices      = ix;
+        skin->indexCount   = static_cast<uint32_t>(newIndices.size());
+        skin->submeshes    = sm;
+        skin->submeshCount = static_cast<uint32_t>(outSections.size());
+
+        // Store a raw pointer: header M2Arrays are de-relocated by FinalizeSkin time and the native
+        // finalize/draw read boneCombos as a pointer. Matches the textureUnitLookup/textureCombinerCombos commits.
+        md->boneCombos.count  = static_cast<uint32_t>(newBoneCombos.size());
+        md->boneCombos.offset = reinterpret_cast<uint32_t>(bc);
+        return true;
+    }
+
+    // Park a level>0 submesh (a level<<16|id sub-batch the 264 engine cannot draw) by zeroing its geometry
+    // and marking badSubmesh; keep boneCount >= 1 (native FinalizeSkin divides boneCountMax by every submesh
+    // boneCount). Clamp a drawn (level 0) submesh's boneCount to the SM3 ceiling and the boneCombos bounds
+    // (>= 1), with a >= 1 bone-influence floor. A zero-geometry section is marked bad.
     void FixSubmeshes(sdk::M2Header* md, sdk::M2SkinProfile* skin, std::vector<uint8_t>& badSubmesh)
     {
         badSubmesh.assign(skin->submeshCount, 0);
@@ -342,6 +602,11 @@ namespace
                 s->indexCount      = 0;
                 s->boneComboIndex  = 0;
                 s->centerBoneIndex = 0;
+            }
+
+            if (s->indexCount == 0)
+            {
+                if (s->boneCount < 1) s->boneCount = 1;
                 badSubmesh[i] = 1;
             }
             else
@@ -471,63 +736,86 @@ namespace
     // follower, so the array grows. The result is committed to skin->batches / skin->batchCount at the
     // FinalizeSkin entry, before the native passes size their parallel +0x188 block from skin->batchCount,
     // so the grow is seen and the block is sized correctly.
+    // Down-convert one batch into 'piece' (1 batch, or primary+follower for an env split). Does not touch
+    // skinSectionIndex; the caller re-points it per target sub-section.
+    void DownConvertBatch(sdk::M2Batch b, uint32_t nTransparencyLookup, std::vector<sdk::M2Batch>& piece,
+                          std::vector<int16_t>& texUnitLookup, std::vector<uint16_t>& blendOverride)
+    {
+        uint16_t shaderId = b.shaderId;
+        uint16_t textureCount = b.textureCount;
+        b.flags &= 0x10;
+
+        if (shaderId >= sdk::modern::kShaderMin)
+        {
+            // Modern shader-effect indices [0..2] are Diffuse_T1_Env env effects the engine renders
+            // natively, re-based to engine index = legionIdx+1 (index 0 is reserved for "no shader").
+            // Emit ONE 2-texture Diffuse_T1_Env batch (T1 + env coord), matching the native env merges;
+            // do NOT route these through the EnvSplit heuristic.
+            uint16_t legionIdx = shaderId & 0x7fff;
+            if (legionIdx <= 2)
+            {
+                b.shaderId               = static_cast<uint16_t>(sdk::modern::kShaderMin | (legionIdx + 1));
+                b.textureCount           = 2;
+                b.textureCoordComboIndex = LookupPair(texUnitLookup, 0, -1);
+                b.flags                 &= 0x10;
+                piece.push_back(b);
+                return;
+            }
+
+            uint16_t low = shaderId & 0xFF;
+            if (EnvSplit(low, shaderId, b, nTransparencyLookup, piece, texUnitLookup, blendOverride))
+                return;
+            switch (low)
+            {
+            case 5: case 8: case 10: case 12: case 16: case 23:
+                shaderId = 0; textureCount = 1; break;
+            case 21:  // Combiners_Mod_Mod
+                shaderId = 0x4011; textureCount = 2; break;
+            default:  // Combiners_Mod
+                shaderId = 0x0010; textureCount = 1; break;
+            }
+        }
+
+        if (shaderId < sdk::modern::kShaderMin)
+            DecodeBlendBits(&b, shaderId, textureCount, texUnitLookup, blendOverride);
+        else
+            b.textureCount = textureCount < 2 ? textureCount : 2;
+
+        piece.push_back(b);
+    }
+
+    // Build the down-converted batch array. Each original batch is processed once, then emitted for every
+    // sub-section its original submesh became (skinSectionIndex re-pointed). A batch on a bad (zero-geometry)
+    // section is reduced to a no-draw 0x8000 batch. With no split, splitMap is empty and every batch maps 1:1.
     void FixTexUnits(sdk::M2SkinProfile* skin, const std::vector<uint8_t>& badSubmesh,
-                     std::vector<sdk::M2Batch>& out, std::vector<int16_t>& texUnitLookup,
-                     std::vector<uint16_t>& blendOverride, uint32_t nTransparencyLookup)
+                     const std::vector<SplitRun>& splitMap, std::vector<sdk::M2Batch>& out,
+                     std::vector<int16_t>& texUnitLookup, std::vector<uint16_t>& blendOverride,
+                     uint32_t nTransparencyLookup)
     {
         out.reserve(skin->batchCount);
         for (uint32_t i = 0; i < skin->batchCount; ++i)
         {
             sdk::M2Batch b = skin->batches[i];   // by value: edits build the new array, originals untouched
-            uint16_t shaderId = b.shaderId;
 
-            if (b.skinSectionIndex < badSubmesh.size() && badSubmesh[b.skinSectionIndex])
+            // The batch's skinSectionIndex still names an ORIGINAL submesh; resolve its new-section run.
+            SplitRun run{ b.skinSectionIndex, 1 };
+            if (b.skinSectionIndex < splitMap.size()) run = splitMap[b.skinSectionIndex];
+
+            std::vector<sdk::M2Batch> piece;
+            DownConvertBatch(b, nTransparencyLookup, piece, texUnitLookup, blendOverride);
+
+            for (uint16_t s = 0; s < run.count; ++s)
             {
-                b.shaderId = 0x8000;   // pass-1 skips 0x8000; the parked submesh draws nothing
-                out.push_back(b);
-                continue;
-            }
-
-            uint16_t textureCount = b.textureCount;
-            b.flags &= 0x10;
-
-            if (shaderId >= sdk::modern::kShaderMin)
-            {
-                // Modern shader-effect indices [0..2] are Diffuse_T1_Env env effects the engine renders
-                // natively, re-based to engine index = legionIdx+1 (index 0 is reserved for "no shader").
-                // Emit ONE 2-texture Diffuse_T1_Env batch (T1 + env coord), matching the native env merges;
-                // do NOT route these through the EnvSplit heuristic.
-                uint16_t legionIdx = shaderId & 0x7fff;
-                if (legionIdx <= 2)
+                uint16_t sectionIdx = static_cast<uint16_t>(run.first + s);
+                bool bad = sectionIdx < badSubmesh.size() && badSubmesh[sectionIdx];
+                for (const sdk::M2Batch& p : piece)
                 {
-                    b.shaderId               = static_cast<uint16_t>(sdk::modern::kShaderMin | (legionIdx + 1));
-                    b.textureCount           = 2;
-                    b.textureCoordComboIndex = LookupPair(texUnitLookup, 0, -1);
-                    b.flags                 &= 0x10;
-                    out.push_back(b);
-                    continue;
-                }
-
-                uint16_t low = shaderId & 0xFF;
-                if (EnvSplit(low, shaderId, b, nTransparencyLookup, out, texUnitLookup, blendOverride))
-                    continue;
-                switch (low)
-                {
-                case 5: case 8: case 10: case 12: case 16: case 23:
-                    shaderId = 0; textureCount = 1; break;
-                case 21:  // Combiners_Mod_Mod
-                    shaderId = 0x4011; textureCount = 2; break;
-                default:  // Combiners_Mod
-                    shaderId = 0x0010; textureCount = 1; break;
+                    sdk::M2Batch nb = p;
+                    nb.skinSectionIndex = sectionIdx;
+                    if (bad) nb.shaderId = 0x8000;   // pass-1 skips 0x8000; the parked submesh draws nothing
+                    out.push_back(nb);
                 }
             }
-
-            if (shaderId < sdk::modern::kShaderMin)
-                DecodeBlendBits(&b, shaderId, textureCount, texUnitLookup, blendOverride);
-            else
-                b.textureCount = textureCount < 2 ? textureCount : 2;
-
-            out.push_back(b);
         }
     }
 
@@ -548,16 +836,15 @@ namespace
         }
     }
 
-    // A skin->batchCount past this is treated as malformed; the env split can up to double it, so cap the
-    // commit well under any value that would overflow the native +0x188 sizing (batchCount*4).
-    constexpr uint32_t kMaxBatches = 0x4000;
-
     void RebuildSkinMaterials(sdk::M2Header* md, sdk::M2SkinProfile* skin, const char* name)
     {
+        // Clamp an aberrant batchCount and continue the conversion (never skip): the native finalize needs a
+        // down-converted skin. Batches past the cap are not drawn.
         if (skin->batchCount > kMaxBatches)
         {
-            WLOG_WARN("MD21: '%s' skin batchCount=%u exceeds cap, skipping rebuild", name, skin->batchCount);
-            return;
+            WLOG_WARN("MD21: '%s' skin batchCount=%u exceeds cap %u, clamping", name, skin->batchCount,
+                      kMaxBatches);
+            skin->batchCount = kMaxBatches;
         }
 
         std::vector<uint8_t> badSubmesh;
@@ -566,8 +853,18 @@ namespace
         std::vector<sdk::M2Batch> batches;
         uint32_t nTransparencyLookup = md->textureWeightCombos.count;   // transparency-lookup count (header +0x90)
 
+        // Partition any drawn submesh whose per-draw bone palette exceeds the SM3 ceiling into <=75-bone
+        // sub-sections, rebuilding the skin geometry + header.boneCombos and re-pointing batches per
+        // sub-section. On any failure (overflow, OOM, missing arrays) the skin is left untouched and the
+        // FixSubmeshes clamp below is the safety net.
+        std::vector<SplitSection> sections;
+        std::vector<SplitRun> splitMap;
+        uint32_t splitCount = 0;
+        if (SplitSubmeshes(md, skin, sections, splitMap, splitCount, name) && splitCount > 0)
+            WLOG_INFO("MD21: '%s' bone-splitter produced %u extra sub-draw(s)", name, splitCount);
+
         FixSubmeshes(md, skin, badSubmesh);
-        FixTexUnits(skin, badSubmesh, batches, texUnitLookup, blendOverride, nTransparencyLookup);
+        FixTexUnits(skin, badSubmesh, splitMap, batches, texUnitLookup, blendOverride, nTransparencyLookup);
 
         // Commit the grown batch array into an owned heap buffer and repoint the skin BEFORE the native
         // FinalizeSkin (g_finalizeOriginal) sizes its +0x188 block from skin->batchCount. skin->batches was

@@ -157,15 +157,29 @@ namespace wraith::m2
         float    sortRadius;        // 0x2C
     };
 
-    // The engine's parsed skin profile, hung off CM2Model+0x170. Sub-array offsets are rewritten to raw
-    // pointers by the skin setup before FinalizeSkin runs. boneCountMax@0x0C seeds the per-draw bone budget.
+    // The engine's parsed skin profile, hung off CM2Model+0x170. This is the LIVE in-memory object, NOT the
+    // on-disk .skin: the parse prepends a 4-byte leading field, so every array sits 4 bytes higher than the
+    // file layout (file vertexLookup M2Array@0x00 -> live vertexCount@0x04 / vertexLookup ptr@0x08, ...).
+    // Array offsets are rewritten to raw pointers before the skin is finalized.
+    // vertexLookup[i] -> global M2Vertex index. indices[] are GLOBAL local-vertex indices (into vertexLookup),
+    // in [section.vertexStart, +vertexCount); the index builder subtracts vertexStart at upload. bones[i]
+    // (uint8[4]) is per local vertex and holds LOCAL indices into the section's boneCombos slice
+    // (header.boneCombos[section.boneComboIndex + bones[i][k]] = the global bone); these ARE the on-GPU vertex
+    // bone indices the c31 palette is addressed by, NOT M2Vertex.boneIndices.
     struct M2SkinProfile
     {
-        uint8_t        _pad0[0x1C];
+        uint32_t       _lead;        // 0x00  parse-prepended leading field (unread by the draw/finalize paths)
+        uint32_t       vertexCount;  // 0x04
+        uint16_t*      vertexLookup; // 0x08
+        uint32_t       indexCount;   // 0x0C
+        uint16_t*      indices;      // 0x10
+        uint32_t       boneCount;    // 0x14  (= vertexCount; bones[] is per local vertex)
+        uint8_t*       bones;        // 0x18  (uint8[4] per local vertex; local boneCombos-slice indices)
         uint32_t       submeshCount; // 0x1C
         M2SkinSection* submeshes;    // 0x20
         uint32_t       batchCount;   // 0x24  (texunits)
         M2Batch*       batches;      // 0x28
+        uint32_t       boneCountMax; // 0x2C  per-draw bone budget seed (used as a divisor at skin finalize)
     };
 
     // Shared camera track body (position/target/roll tracks + their bases). Identical across versions.
@@ -216,8 +230,18 @@ namespace wraith::m2
     static_assert(offsetof(M2Ribbon, priorityPlane) == 0xAC, "M2Ribbon.priorityPlane");
     static_assert(sizeof(M2SkinSection) == 0x30, "M2SkinSection");
     static_assert(offsetof(M2SkinSection, level) == 0x02, "level");
+    // Live skin object offsets (the +4-shifted in-memory layout, not the on-disk .skin).
+    static_assert(offsetof(M2SkinProfile, vertexCount) == 0x04, "skin.vertexCount");
+    static_assert(offsetof(M2SkinProfile, vertexLookup) == 0x08, "skin.vertexLookup");
+    static_assert(offsetof(M2SkinProfile, indexCount) == 0x0C, "skin.indexCount");
+    static_assert(offsetof(M2SkinProfile, indices) == 0x10, "skin.indices");
+    static_assert(offsetof(M2SkinProfile, bones) == 0x18, "skin.bones");
     static_assert(offsetof(M2SkinProfile, submeshCount) == 0x1C, "submeshCount");
+    static_assert(offsetof(M2SkinProfile, submeshes) == 0x20, "submeshes");
+    static_assert(offsetof(M2SkinProfile, batchCount) == 0x24, "batchCount");
     static_assert(offsetof(M2SkinProfile, batches) == 0x28, "batches");
+    static_assert(offsetof(M2SkinProfile, boneCountMax) == 0x2C, "boneCountMax");
+    static_assert(sizeof(M2SkinProfile) == 0x30, "M2SkinProfile");
     static_assert(sizeof(Md21Header) == 8, "Md21Header");
     static_assert(sizeof(M2Camera) == 0x64, "M2Camera");
 
