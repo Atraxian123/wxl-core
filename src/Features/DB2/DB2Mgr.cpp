@@ -13,7 +13,6 @@ namespace wraith::features::db2
     void Install()
     {
         // Tables load lazily via the Definition singletons. The probe observes CharSections lookups.
-        InstallCharSectionsProbe();
         WLOG_INFO("DB2: subsystem ready");
     }
 
