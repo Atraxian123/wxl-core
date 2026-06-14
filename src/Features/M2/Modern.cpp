@@ -384,6 +384,16 @@ namespace
             return false;
         }
 
+        // Rebuild only when a drawn submesh exceeds the SM3 ceiling. Models that already fit keep the native
+        // skin untouched (the FixSubmeshes clamp path), avoiding an unnecessary geometry rebuild.
+        bool needsSplit = false;
+        for (uint32_t si = 0; si < skin->submeshCount; ++si)
+        {
+            const sdk::M2SkinSection& s = skin->submeshes[si];
+            if (s.level == 0 && s.boneCount > kMaxBonesPerDraw) { needsSplit = true; break; }
+        }
+        if (!needsSplit) return false;
+
         std::vector<uint16_t> newVtxLookup;
         std::vector<uint8_t>  newBones;          // 4 bytes per new local vertex
         std::vector<uint16_t> newIndices;
