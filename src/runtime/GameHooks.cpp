@@ -42,10 +42,13 @@ namespace
     adt::Map_ChunkBuildFn      g_origChunkBuild   = nullptr;
     wld::World_EnterFn         g_origWorldEnter   = nullptr;
 
-    // Model init parses the file into the runtime model (this-in-ECX). After it returns the model is fully
-    // parsed, so OnModelLoad fires with the now-ready model object.
+    // Model init parses the file into the runtime model (this-in-ECX). OnModelLoadPre fires at entry, while
+    // the raw .m2 bytes (model+0x150 / size +0x16c)
+    // the buffer. OnModelLoad fires after, with the now-parsed model.
     int __fastcall hkM2Init(void* model)
     {
+        ev::ModelLoadArgs pre{ model };
+        ev::Emit(ev::Event::OnModelLoadPre, &pre);
         const int r = g_origM2Init(model);
         ev::ModelLoadArgs a{ model };
         ev::Emit(ev::Event::OnModelLoad, &a);

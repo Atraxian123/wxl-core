@@ -26,6 +26,7 @@ namespace wxl::events
 {
     enum class Event : uint32_t
     {
+        OnModelLoadPre,  // a model's raw bytes are read, before parse (ModelLoadArgs)
         OnModelLoad,     // a model finished loading and is parsed     (ModelLoadArgs)
         OnFrame,         // per-frame Present                          (FrameArgs)
         OnEndScene,      // end of the frame, before present           (EndSceneArgs)

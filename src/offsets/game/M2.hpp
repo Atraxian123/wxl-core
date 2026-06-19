@@ -57,9 +57,14 @@ namespace wxl::offsets::game::m2
     // Per-sequence track de-relocator (model, seqIdx, buffer, size): validates the buffer and rebases
     // sequence seqIdx's track inner slots against it, then updates the sequence flags.
     constexpr uintptr_t kPerSeqDeReloc = 0x0083C6E0;
-    // External-anim buffer allocator (size, name, line): allocates size+pad and returns an aligned
-    // pointer carrying a back-shift byte at [ptr-1].
+    // M2 buffer allocator (size, name, line): allocates size+0x10, returns a 16-aligned pointer carrying a
+    // back-shift byte at [ptr-1]. This is the allocator the .m2 load buffer (model+0x150) uses, so a
+    // replacement buffer must come from here for the model destructor's matching free to be valid.
     constexpr uintptr_t kAnimBufferAlloc = 0x0083DE50;
+    constexpr uintptr_t kBufferAlloc     = 0x0083DE50; // alias: same allocator, used for buffer swaps
+    constexpr uintptr_t kBufferFree      = 0x0083DE90; // free a kBufferAlloc pointer (recovers base via [ptr-1])
+    using M2_BufferAllocFn = void*(__cdecl*)(uint32_t size, const char* tag, int line);
+    using M2_BufferFreeFn  = void (__cdecl*)(void* ptr);
 
     // I/O record field offsets used by the rebase: the buffer base and its byte size.
     constexpr size_t kOffRecordBuffer = 0x04;
@@ -105,7 +110,8 @@ namespace wxl::offsets::game::m2
     // --- runtime model object fields ---
     constexpr size_t kOffModelFlags    = 0x08;  // bit 2 selects the sibling-file open flag
     constexpr size_t kOffModelPathStem = 0x3C;  // model path stem (no extension)
-    constexpr size_t kOffModelHeader   = 0x150; // -> parsed file header
+    constexpr size_t kOffModelHeader   = 0x150; // -> raw .m2 file buffer (parsed in place -> becomes the header)
+    constexpr size_t kOffModelFileSize = 0x16C; // byte size of the .m2 file buffer at +0x150
 
     // --- parsed file-header fields ---
     constexpr size_t kOffHdrGlobalFlags = 0x10; // bit 0x20 = model carries physics

@@ -47,6 +47,30 @@ namespace wxl::game::m2
         Native<off::M2_PushAlphaRefFn>(off::kPushAlphaRef)(ref);
     }
 
+    // --- raw .m2 file buffer (valid at parse time, e.g. from OnModelLoadPre) ---
+    // The whole .m2 file is read into a heap buffer at model+0x150. The byte size is at model+0x16c.
+    inline void*    FileBuffer(void* model) { return *reinterpret_cast<void**>   (reinterpret_cast<char*>(model) + off::kOffModelHeader); }
+    inline uint32_t FileSize  (void* model) { return *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(model) + off::kOffModelFileSize); }
+
+    // Allocate / free a buffer with the SAME allocator the .m2 load buffer uses, so a replacement buffer is
+    // freed correctly by the model destructor (it relies on the back-shift byte at [ptr-1]). The caller
+    // passes its own debug tag so the core stays version-agnostic (each support module supplies its name).
+    inline void* AllocBuffer(uint32_t size, const char* tag)
+    {
+        return Native<off::M2_BufferAllocFn>(off::kBufferAlloc)(size, tag, 0);
+    }
+    inline void FreeBuffer(void* ptr)
+    {
+        Native<off::M2_BufferFreeFn>(off::kBufferFree)(ptr);
+    }
+
+    // Point the model at a different .m2 image (buffer + byte size). The parser reads these on the next call.
+    inline void ReplaceBuffer(void* model, void* buffer, uint32_t size)
+    {
+        *reinterpret_cast<void**>   (reinterpret_cast<char*>(model) + off::kOffModelHeader)   = buffer;
+        *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(model) + off::kOffModelFileSize) = size;
+    }
+
     // Add the M2 bindings to the enumerable catalog (cold, at startup).
     inline void RegisterCatalog()
     {
