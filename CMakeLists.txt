@@ -15,6 +15,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # feeds the IDE the real C++20 flags
 
 set(WXL_DEFS WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
 
+# Client directory to deploy the built DLL into. Passed by build.ps1 (-DCLIENT_PATH=...) and cached.
+set(CLIENT_PATH "" CACHE PATH "Client folder the built DLL is copied into after each build")
+
 # --- Automatic, recursive source discovery (no hand-written paths) ---------------------------------
 # CONFIGURE_DEPENDS re-globs at build time, so dropping a file (or a whole script) needs no edit here.
 # Each binary takes its own slice: the DLL excludes the patcher/host trees; the patcher takes only its.
@@ -45,6 +48,13 @@ target_link_libraries(WarcraftXL PRIVATE minhook d3d9 d3dcompiler)
 target_compile_definitions(WarcraftXL PRIVATE ${WXL_DEFS})
 
 source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${WXL_CORE_SRC} ${WXL_RUNTIME_SCRIPT})
+
+# Deploy: copy the freshly linked DLL into the client folder after every build (no separate install step).
+if(CLIENT_PATH)
+    add_custom_command(TARGET WarcraftXL POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:WarcraftXL>" "${CLIENT_PATH}/WarcraftXL.dll"
+        COMMENT "Deploy WarcraftXL.dll -> ${CLIENT_PATH}")
+endif()
 
 # =============================================================================
 # Target 2: wxl-patcher.exe  = the offline PE patcher + patcher scripts
