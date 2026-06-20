@@ -46,6 +46,10 @@ namespace wxl::events
         OnWmoGroupLoad,  // a WMO group buffer is read, before the walk(WmoGroupLoadArgs)
         OnTextureUpload, // a texture is about to upload to the device (TextureUploadArgs)
         OnBlpLoad,       // a BLP texture was requested by name           (BlpLoadArgs)
+        OnObjectUpdate,  // a server object create/update batch parsed     (ObjectUpdateArgs)
+        OnObjectDestroy, // an object is about to despawn                  (ObjectDestroyArgs)
+        OnTargetChanged, // the player's target was set via the API        (TargetChangedArgs)
+        OnSoundPlay,     // a UI/world sound is about to play              (SoundPlayArgs)
         OnDoodadSpawn,   // a placed map doodad (CMapDoodad) was built (DoodadSpawnArgs)
         OnWorldEnter,    // the world/map finished loading, in-world   (WorldEnterArgs)
         OnWorldLeave,    // the world/map is being torn down           (WorldLeaveArgs)
@@ -140,6 +144,27 @@ namespace wxl::events
      *        handle (may be null on failure). Fires on every reference, cached or not. Read-only.
      */
     struct BlpLoadArgs       { const char* name; void* handle; };
+    /**
+     * @brief Args for OnObjectUpdate, fired after a server update message is parsed (a batch of objects
+     *        created or field-updated). packet is the inbound message reader (cursor already consumed);
+     *        opcode is the message opcode. Read-only.
+     */
+    struct ObjectUpdateArgs  { void* packet; int opcode; };
+    /**
+     * @brief Args for OnObjectDestroy, fired before an object despawns while it is still resident. packet
+     *        holds the object GUID and an on-death flag; opcode is the message opcode. Read-only.
+     */
+    struct ObjectDestroyArgs { void* packet; int opcode; };
+    /**
+     * @brief Args for OnTargetChanged, fired after the target-set API applied a new target. scriptState is
+     *        the script state the call ran on; read the applied target GUID via wxl::game (kTargetGuid).
+     */
+    struct TargetChangedArgs { void* scriptState; };
+    /**
+     * @brief Args for OnSoundPlay, fired before a UI/world sound plays. scriptState is the script state
+     *        the call ran on; the sound id/name is on its stack. Read-only.
+     */
+    struct SoundPlayArgs     { void* scriptState; };
     /** @brief Args for OnDoodadSpawn; read the transform via wxl::game::doodad. */
     struct DoodadSpawnArgs   { void* doodad; };
     /** @brief Args for OnWorldEnter. */

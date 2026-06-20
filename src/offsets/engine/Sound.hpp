@@ -28,6 +28,11 @@ namespace wxl::offsets::engine::sound
     constexpr uintptr_t kSetMasterVolume = 0x00879460;
     using SetMasterVolumeFn = void(__cdecl*)(float volume);
 
+    // PlaySound script function: plays a 2D UI sound by id/name. __cdecl(scriptState); the sound id/name
+    // is on the script stack. A detour observes (or, by skipping the original, suppresses) UI/world sounds.
+    constexpr uintptr_t kPlaySound = 0x009858B0;
+    using PlaySoundFn = int(__cdecl*)(void* scriptState);
+
     // Non-zero once the sound system is initialized.
     constexpr uintptr_t kSoundActiveFlag = 0x00D43814;
 

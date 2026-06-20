@@ -34,6 +34,24 @@ namespace wxl::offsets::game::unit
     // Reaction of self toward other (this-in-ECX): 0..1 hostile, 2..3 neutral, 4+ friendly.
     constexpr uintptr_t kUnitReaction = 0x007251C0;
 
+    // --- object lifecycle (server-driven) ---
+    // Object update-block handler: parses a server update message, creating new objects in the object
+    // manager or applying field deltas to existing GUIDs. One call per message (a batch of objects); hook
+    // POST-call to observe the freshly created/updated set.
+    constexpr uintptr_t kObjectUpdateHandler  = 0x004D73A0;
+    // Object destroy handler: reads a GUID and an on-death flag, looks the object up, runs its destroy
+    // path and removes it from the object manager. One call per despawn; hook PRE-call to read the doomed
+    // object while it is still resident.
+    constexpr uintptr_t kObjectDestroyHandler = 0x004D7610;
+    // Both handlers: __cdecl(ctx, opcode, msg, packet); packet (arg 4) is the inbound message reader.
+    using ObjectMsgHandlerFn = int(__cdecl*)(void* ctx, int opcode, int msg, void* packet);
+
+    // --- target ---
+    // Target-set script function: resolves a unit token and sets the player's current target (writes
+    // kTargetGuid). __cdecl(scriptState); hook POST-call to read the applied target from kTargetGuid.
+    constexpr uintptr_t kTargetSet = 0x0051A5C0;
+    using TargetSetFn = int(__cdecl*)(void* scriptState);
+
     // --- object field offsets ---
     constexpr size_t kUnitModelField   = 0xB4; // unit object -> body model
     constexpr size_t kModelParentField = 0x48; // model -> parent model (0 = root)

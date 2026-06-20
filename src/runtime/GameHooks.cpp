@@ -21,9 +21,11 @@
 #include "events/Event.hpp"
 #include "offsets/engine/Frame.hpp"
 #include "offsets/engine/Gx.hpp"
+#include "offsets/engine/Sound.hpp"
 #include "offsets/game/ADT.hpp"
 #include "offsets/game/Doodad.hpp"
 #include "offsets/game/M2.hpp"
+#include "offsets/game/Unit.hpp"
 #include "offsets/game/WMO.hpp"
 #include "offsets/game/World.hpp"
 
@@ -44,6 +46,8 @@ namespace
     namespace wmo   = wxl::offsets::game::wmo;
     namespace wld   = wxl::offsets::game::world;
     namespace frame = wxl::offsets::engine::frame;
+    namespace unit  = wxl::offsets::game::unit;
+    namespace snd   = wxl::offsets::engine::sound;
 
     m2::M2_InitFn              g_origM2Init       = nullptr;
     m2::M2_FinalizeSkinFn      g_origFinalizeSkin = nullptr;
@@ -56,6 +60,10 @@ namespace
     wmo::WmoGroup_ParseFn      g_origWmoGroup     = nullptr;
     wld::World_EnterFn         g_origWorldEnter   = nullptr;
     frame::FramePumpFn         g_origFramePump    = nullptr;
+    unit::ObjectMsgHandlerFn   g_origObjUpdate    = nullptr;
+    unit::ObjectMsgHandlerFn   g_origObjDestroy   = nullptr;
+    unit::TargetSetFn          g_origTargetSet    = nullptr;
+    snd::PlaySoundFn           g_origPlaySound    = nullptr;
 
     /**
      * @brief Detours model init, emitting OnModelLoadPre at entry and OnModelLoad after parsing.
@@ -175,6 +183,81 @@ namespace
     }
 
     /**
+     * @brief Detours the server object update-block handler, emitting OnObjectUpdate after the parse.
+     *
+     * One fire per update message (a batch of created/updated objects). Logs the first fire only.
+     * @param ctx     handler context.
+     * @param opcode  message opcode.
+     * @param msg     message id.
+     * @param packet  inbound message reader.
+     * @return the native handler result.
+     */
+    int __cdecl hkObjUpdate(void* ctx, int opcode, int msg, void* packet)
+    {
+        const int r = g_origObjUpdate(ctx, opcode, msg, packet);
+
+        ev::ObjectUpdateArgs a{ packet, opcode };
+        ev::Emit(ev::Event::OnObjectUpdate, &a);
+
+        static bool logged = false;
+        if (!logged) { logged = true; WLOG_INFO("object: update stream active"); }
+        return r;
+    }
+
+    /**
+     * @brief Detours the object destroy handler, emitting OnObjectDestroy before the despawn.
+     *
+     * One fire per despawn, while the object is still resident. Logs the first fire only.
+     * @param ctx     handler context.
+     * @param opcode  message opcode.
+     * @param msg     message id.
+     * @param packet  inbound message reader (object GUID + on-death flag).
+     * @return the native handler result.
+     */
+    int __cdecl hkObjDestroy(void* ctx, int opcode, int msg, void* packet)
+    {
+        ev::ObjectDestroyArgs a{ packet, opcode };
+        ev::Emit(ev::Event::OnObjectDestroy, &a);
+
+        static bool logged = false;
+        if (!logged) { logged = true; WLOG_INFO("object: destroy hook active"); }
+        return g_origObjDestroy(ctx, opcode, msg, packet);
+    }
+
+    /**
+     * @brief Detours the target-set API, emitting OnTargetChanged after the new target is applied.
+     * @param scriptState  script state the call ran on.
+     * @return the native function result.
+     */
+    int __cdecl hkTargetSet(void* scriptState)
+    {
+        const int r = g_origTargetSet(scriptState);
+
+        ev::TargetChangedArgs a{ scriptState };
+        ev::Emit(ev::Event::OnTargetChanged, &a);
+
+        WLOG_INFO("target: changed");
+        return r;
+    }
+
+    /**
+     * @brief Detours the play-sound API, emitting OnSoundPlay before the sound starts.
+     *
+     * Fires on every UI/world sound. Logs the first fire only.
+     * @param scriptState  script state the call ran on (the sound id/name is on its stack).
+     * @return the native function result.
+     */
+    int __cdecl hkPlaySound(void* scriptState)
+    {
+        ev::SoundPlayArgs a{ scriptState };
+        ev::Emit(ev::Event::OnSoundPlay, &a);
+
+        static bool logged = false;
+        if (!logged) { logged = true; WLOG_INFO("sound: play hook active"); }
+        return g_origPlaySound(scriptState);
+    }
+
+    /**
      * @brief Detours map-chunk build, emitting OnAdtChunkBuild with the chunk and its layer count.
      *
      * Runs after the native build populates the sub-chunk pointers and layer units, so the
@@ -291,7 +374,19 @@ namespace wxl::runtime::game
         wxl::core::hook::Install("FramePump", frame::kFramePump,
                                  reinterpret_cast<void*>(&hkFramePump),
                                  reinterpret_cast<void**>(&g_origFramePump));
+        wxl::core::hook::Install("ObjectUpdate", unit::kObjectUpdateHandler,
+                                 reinterpret_cast<void*>(&hkObjUpdate),
+                                 reinterpret_cast<void**>(&g_origObjUpdate));
+        wxl::core::hook::Install("ObjectDestroy", unit::kObjectDestroyHandler,
+                                 reinterpret_cast<void*>(&hkObjDestroy),
+                                 reinterpret_cast<void**>(&g_origObjDestroy));
+        wxl::core::hook::Install("TargetSet", unit::kTargetSet,
+                                 reinterpret_cast<void*>(&hkTargetSet),
+                                 reinterpret_cast<void**>(&g_origTargetSet));
+        wxl::core::hook::Install("PlaySound", snd::kPlaySound,
+                                 reinterpret_cast<void*>(&hkPlaySound),
+                                 reinterpret_cast<void**>(&g_origPlaySound));
 
-        WLOG_INFO("game: hooks installed (M2Init, M2FinalizeSkin, M2SetupBatchAlpha, DoodadSpawn, TextureUpdate, TextureCreate, ChunkBuild, WmoRootComplete, WmoGroupParse, CWorldEnter, FramePump)");
+        WLOG_INFO("game: hooks installed (M2Init, M2FinalizeSkin, M2SetupBatchAlpha, DoodadSpawn, TextureUpdate, TextureCreate, ChunkBuild, WmoRootComplete, WmoGroupParse, CWorldEnter, FramePump, ObjectUpdate, ObjectDestroy, TargetSet, PlaySound)");
     }
 }
