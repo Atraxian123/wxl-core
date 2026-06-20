@@ -1,5 +1,5 @@
-// Storage I/O hook: asset-agnostic forwarder of Storm file opens to the host.
-// Copyright (C) 2026 WraithEngine
+// Storage I/O hook: launch the host, then forward archive file opens to it (asset-agnostic).
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -16,11 +16,13 @@
 
 #pragma once
 
-// DLL-only RUNTIME feature. Touches live engine objects / the GPU. Never moves to host.
-namespace wraith::runtime::storage
+namespace wxl::runtime::storage
 {
-    // Register this feature's hooks. Called once at bootstrap (cold path).
+    /**
+     * @brief Launches the asset host and hooks the client archive file-I/O primitives.
+     *
+     * A file the host serves is read from the host's bytes; everything else runs native. The hooks
+     * are harmless with no host (every open falls through). Call once at startup, before EnableAll.
+     */
     void Install();
-    // Forward one open to the host; inline small files, stream large via handles.
-    // (Concrete request path; see ipc/ for the transport.)
 }

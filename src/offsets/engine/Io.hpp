@@ -1,5 +1,5 @@
 // Archive file-I/O primitive addresses, their signatures, and the whole-file open flag.
-// Copyright (C) 2026 WraithEngine
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -18,8 +18,9 @@
 
 #include <cstdint>
 
-// Archive file-I/O primitives. All callee-cleaned. Hooked to serve reads from the host.
-namespace wraith::offsets::engine::io
+// INTERNAL to the core. Archive file-I/O primitives, all callee-cleaned. Hooked to serve reads from
+// an external source. Modules never include this; they use wxl::game / wxl::events.
+namespace wxl::offsets::engine::io
 {
     // Open (archiveOrNull, name, flags, &handle) -> nonzero, fills handle.
     constexpr uintptr_t kFileOpen  = 0x00424B50;
@@ -39,9 +40,7 @@ namespace wraith::offsets::engine::io
 
     using Storage_FileOpenFn  = int(__stdcall*)(void* archive, const char* name, uint32_t flags, void** out);
     using Storage_FileSizeFn  = uint32_t(__stdcall*)(void* handle, uint32_t* sizeHigh);
-    using Storage_FileReadFn  = int(__stdcall*)(void* handle, void* dst, uint32_t len, uint32_t* read,
-                                                void* ovl, uint32_t unk);
-    using Storage_FileSeekFn  = uint32_t(__stdcall*)(void* handle, int32_t distLow, uint32_t* distHigh,
-                                                     uint32_t method);
+    using Storage_FileReadFn  = int(__stdcall*)(void* handle, void* dst, uint32_t len, uint32_t* read, void* ovl, uint32_t unk);
+    using Storage_FileSeekFn  = uint32_t(__stdcall*)(void* handle, int32_t distLow, uint32_t* distHigh, uint32_t method);
     using Storage_FileCloseFn = int(__stdcall*)(void* handle);
 }

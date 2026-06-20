@@ -1,6 +1,5 @@
-// Data-table runtime offsets: live-image addresses for the map-data override and the data-table
-// definitions that replace stock data tables in place.
-// Copyright (C) 2026 WraithEngine
+// Data-table runtime storage offsets and definition-override targets.
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -19,9 +18,10 @@
 
 #include <cstdint>
 
-// Data-table runtime offsets. The map-data override rewrites the in-memory map storage built by the
-// engine; the definition overrides target the stock storage object + accessor of each replaced table.
-namespace wraith::offsets::game::db2
+// INTERNAL to the core. Data-table runtime offsets. The map-data override rewrites the in-memory map
+// storage built by the engine; the definition overrides target the stock storage object + accessor of
+// each replaced table. Modules never include this; they use wxl::game / wxl::events.
+namespace wxl::offsets::game::db2
 {
     // -------------------------------------------------------------------------
     // Map storage. The engine compacts each on-disk map row into a fixed-size in-memory record and

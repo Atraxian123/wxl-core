@@ -1,5 +1,5 @@
 // Terrain per-chunk draw entry addresses, their signatures, and draw-node field offsets.
-// Copyright (C) 2026 WraithEngine
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -19,8 +19,9 @@
 #include <cstdint>
 #include <cstddef>
 
-// Terrain per-chunk draw entries and the variants the live render-state selector dispatches to.
-namespace wraith::offsets::engine::draw
+// INTERNAL to the core. Terrain per-chunk draw entries and the variants the live render-state
+// selector dispatches to.
+namespace wxl::offsets::engine::draw
 {
     // Candidate per-chunk terrain draw entries, each taking the render node. The first two take the
     // node in the this-register; the last two take it on the stack. Used to discover which variant the

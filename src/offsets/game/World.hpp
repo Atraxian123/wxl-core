@@ -1,5 +1,5 @@
-// World tick / load-gate / async-I/O entry addresses, globals, and their signatures.
-// Copyright (C) 2026 WraithEngine
+// World tick / load-gate entries, async-I/O queue primitives, and the load-state globals.
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -18,8 +18,9 @@
 
 #include <cstdint>
 
-// World tick / load-gate entries, async-I/O queue primitives, and the load-state globals.
-namespace wraith::offsets::game::world
+// INTERNAL to the core. World tick / load-gate entries, async-I/O queue primitives, and the
+// load-state globals. Modules never include this; they use wxl::game / wxl::events.
+namespace wxl::offsets::game::world
 {
     // --- world tick / load gate ---
     // World tick + loading-screen synchronous drain (param): while the load-gate flag is set this runs
@@ -27,6 +28,11 @@ namespace wraith::offsets::game::world
     constexpr uintptr_t kTick = 0x007B6B00;
     // Load-gate flag (u32): nonzero while the blocking drain runs.
     constexpr uintptr_t kLoadActive = 0x00ADFBC8;
+    // CWorld::Enter(time, withLoadingScreen): unloads the old world and loads the new one (calls the
+    // blocking load), then dismisses the loading screen. At entry the old world is still intact (leave
+    // point); after it returns the new world + objects are resident (enter point).
+    constexpr uintptr_t kEnter = 0x00781500;
+    using World_EnterFn = void(__cdecl*)(int worldTime, int withLoadingScreen);
     // Focus world position floats X/Y/Z (the center of the load box / player position).
     constexpr uintptr_t kFocusPosX = 0x00CD7778;
     constexpr uintptr_t kFocusPosY = 0x00CD777C;

@@ -1,4 +1,5 @@
-// Copyright (C) 2026 WraithEngine
+// ShmServer: the host side of the shared-memory transport (create window + per-channel events).
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -13,26 +14,29 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-#include "ShmServer.hpp"
+#include "ipc/ShmServer.hpp"
 
 #include <windows.h>
 
-using namespace wraith::ipc;
+using namespace wxl::ipc;
 
 namespace
 {
-    // Shared window + per-channel event pairs. The host OWNS (creates) these; the client opens them.
-    // State is set once in Create and read-only afterwards, so workers touch it without a lock: each
-    // worker only ever reads/writes its OWN channel's payload, and the control words it touches
-    // (reqLen/respLen/respSeq) are single-writer per channel.
+    // Shared window and per-channel event pairs. The host creates these; the client opens them. Set once
+    // in Create and read-only afterwards: each worker touches only its own channel's payload, and the
+    // control words it writes (respLen/respSeq) are single-writer per channel.
     HANDLE   g_shm = nullptr;
     uint8_t* g_base = nullptr;
     HANDLE   g_reqEv[kChannels]  = {};
     HANDLE   g_respEv[kChannels] = {};
 }
 
-namespace wraith::host::ipc
+namespace wxl::host::ipc
 {
+    /**
+     * @brief Creates and maps the shared window, stamps each channel header, and creates the events.
+     * @return true on success
+     */
     bool Create()
     {
         g_shm = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, kShmSize, kShmName);
@@ -49,7 +53,7 @@ namespace wraith::host::ipc
             hdr->version = kVersion;
         }
 
-        // Auto-reset events, initially non-signaled. Client opens the same names.
+        // Auto-reset events, initially non-signaled. The client opens the same names.
         for (uint32_t i = 0; i < kChannels; ++i)
         {
             char rn[64], sn[64];
@@ -62,6 +66,12 @@ namespace wraith::host::ipc
         return true;
     }
 
+    /**
+     * @brief Blocks on channel `i`'s request event and copies the request payload out.
+     * @param i       channel index
+     * @param reqOut  receives the request payload bytes
+     * @return true if a request was read
+     */
     bool WaitRequest(uint32_t i, std::vector<uint8_t>& reqOut)
     {
         if (i >= kChannels) return false;
@@ -75,6 +85,12 @@ namespace wraith::host::ipc
         return true;
     }
 
+    /**
+     * @brief Copies the response payload into channel `i`, marks it complete, and signals the client.
+     * @param i     channel index
+     * @param resp  response payload bytes
+     * @return true if a nonzero-length response was written
+     */
     bool PostResponse(uint32_t i, std::span<const uint8_t> resp)
     {
         if (i >= kChannels) return false;

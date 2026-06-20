@@ -1,4 +1,5 @@
-// Copyright (C) 2026 WraithEngine
+// MpqStore: asset-agnostic archive I/O over StormLib that serves raw bytes.
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -13,9 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-#include "MpqStore.hpp"
+#include "mpq/MpqStore.hpp"
 
-#include "Logger.hpp"
+#include "core/Logger.hpp"
 
 #include <StormLib.h>
 
@@ -26,19 +27,33 @@
 
 namespace
 {
+    /**
+     * @brief Reports whether `path` names an existing file on disk (not a directory).
+     * @param path  absolute file path
+     * @return true if the file exists
+     */
     bool FileExistsOnDisk(const std::string& path)
     {
         DWORD a = GetFileAttributesA(path.c_str());
         return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
     }
 
+    /**
+     * @brief Returns a lowercased copy of `s`.
+     * @param s  input string
+     * @return lowercased string
+     */
     std::string ToLower(std::string s)
     {
         for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         return s;
     }
 
-    // Archive-internal names use backslashes. Accept either separator from the client and normalise.
+    /**
+     * @brief Reshapes a client file name to the archive-internal form: backslashes, no leading separators.
+     * @param name  file name from the client (either separator)
+     * @return archive-internal name
+     */
     std::string NormalizeName(std::string_view name)
     {
         std::string n(name);
@@ -49,14 +64,22 @@ namespace
     }
 }
 
-namespace wraith::host::mpq
+namespace wxl::host::mpq
 {
+    namespace log = wxl::core::log;
+
+    /** @brief Closes all open archive handles. */
     MpqStore::~MpqStore()
     {
         for (void* h : m_archives) if (h) SFileCloseArchive(static_cast<HANDLE>(h));
         m_archives.clear();
     }
 
+    /**
+     * @brief Mounts the locale and base archives plus loose override folders under the data root.
+     * @param dataDir  client data root
+     * @return true if at least one archive or loose root mounted
+     */
     bool MpqStore::Mount(std::string_view dataDir)
     {
         std::string root(dataDir);
@@ -95,11 +118,9 @@ namespace wraith::host::mpq
 
         // Archive set, highest priority first (search order).
         std::vector<std::string> candidates = {
-            // patches, descending (locale variant above its base-number sibling)
             "Data\\" + loc + "\\patch-" + loc + "-3.MPQ", "Data\\patch-3.MPQ",
             "Data\\" + loc + "\\patch-" + loc + "-2.MPQ", "Data\\patch-2.MPQ",
             "Data\\" + loc + "\\patch-" + loc + ".MPQ",   "Data\\patch.MPQ",
-            // locale archives
             "Data\\" + loc + "\\locale-" + loc + ".MPQ",
             "Data\\" + loc + "\\base-" + loc + ".MPQ",
             "Data\\" + loc + "\\expansion-locale-" + loc + ".MPQ",
@@ -108,7 +129,6 @@ namespace wraith::host::mpq
             "Data\\" + loc + "\\expansion-speech-" + loc + ".MPQ",
             "Data\\" + loc + "\\lichking-speech-" + loc + ".MPQ",
             "Data\\" + loc + "\\backup-" + loc + ".MPQ",
-            // base / expansion
             "Data\\lichking.MPQ",
             "Data\\expansion.MPQ",
             "Data\\common-2.MPQ",
@@ -131,22 +151,27 @@ namespace wraith::host::mpq
             }
             else
             {
-                wraith::core::log::Printf("mpq: open failed (%lu) %s", GetLastError(), rel.c_str());
+                log::Printf("mpq: open failed (%lu) %s", GetLastError(), rel.c_str());
             }
         }
         const ULONGLONG mountMs = GetTickCount64() - t0;
 
-        wraith::core::log::Printf("mpq: locale=%s, %zu archives, %zu loose roots, mounted in %llu ms",
+        log::Printf("mpq: locale=%s, %zu archives, %zu loose roots, mounted in %llu ms",
             m_locale.empty() ? "(none)" : m_locale.c_str(), m_archives.size(), m_looseRoots.size(),
             static_cast<unsigned long long>(mountMs));
         for (size_t i = 0; i < m_archiveNames.size(); ++i)
-            wraith::core::log::Printf("mpq:   [%zu] %s", i, m_archiveNames[i].c_str());
+            log::Printf("mpq:   [%zu] %s", i, m_archiveNames[i].c_str());
         for (const std::string& lr : m_looseRoots)
-            wraith::core::log::Printf("mpq:   loose <- %s", lr.c_str());
+            log::Printf("mpq:   loose <- %s", lr.c_str());
 
         return !m_archives.empty() || !m_looseRoots.empty();
     }
 
+    /**
+     * @brief Reports whether the file exists in any loose root or mounted archive.
+     * @param rawName  file name from the client
+     * @return true if the file is present
+     */
     bool MpqStore::Exists(std::string_view rawName) const
     {
         const std::string name = NormalizeName(rawName);
@@ -157,6 +182,12 @@ namespace wraith::host::mpq
         return false;
     }
 
+    /**
+     * @brief Reads the whole file, preferring loose override folders over the archives.
+     * @param rawName  file name from the client
+     * @param out      receives the file bytes
+     * @return false if the file is absent
+     */
     bool MpqStore::ReadAll(std::string_view rawName, std::vector<uint8_t>& out) const
     {
         const std::string name = NormalizeName(rawName);
@@ -192,6 +223,14 @@ namespace wraith::host::mpq
         return false;
     }
 
+    /**
+     * @brief Reads a byte range, preferring loose override folders over the archives.
+     * @param rawName  file name from the client
+     * @param off      start offset
+     * @param len      maximum number of bytes to read
+     * @param out      receives the bytes read (clamped to file end)
+     * @return false if the file is absent
+     */
     bool MpqStore::ReadRange(std::string_view rawName, uint32_t off, uint32_t len,
                              std::vector<uint8_t>& out) const
     {

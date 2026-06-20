@@ -1,5 +1,5 @@
 // Named hooking over MinHook: install by name + address, enable in one batch.
-// Copyright (C) 2026 WraithEngine
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -14,13 +14,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-#include "Hook.hpp"
-#include "Logger.hpp"
+#include "core/Hook.hpp"
+#include "core/Logger.hpp"
 
 #include <MinHook.h>
 
-namespace wraith::hook
+namespace wxl::core::hook
 {
+    /**
+     * @brief Initialises the hooking engine once at startup.
+     * @return true if initialisation succeeded.
+     */
     bool Init()
     {
         MH_STATUS s = MH_Initialize();
@@ -32,6 +36,14 @@ namespace wraith::hook
         return true;
     }
 
+    /**
+     * @brief Installs one detour.
+     * @param name      label used for logging.
+     * @param target    engine function address to detour.
+     * @param detour    replacement function.
+     * @param original  receives the trampoline to the original function.
+     * @return true if the detour was created.
+     */
     bool Install(const char* name, void* target, void* detour, void** original)
     {
         MH_STATUS s = MH_CreateHook(target, detour, original);
@@ -44,6 +56,10 @@ namespace wraith::hook
         return true;
     }
 
+    /**
+     * @brief Enables every installed hook.
+     * @return true if all hooks were enabled.
+     */
     bool EnableAll()
     {
         MH_STATUS s = MH_EnableHook(MH_ALL_HOOKS);

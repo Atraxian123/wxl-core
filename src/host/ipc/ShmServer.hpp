@@ -1,4 +1,5 @@
-// Copyright (C) 2026 WraithEngine
+// ShmServer: the host side of the shared-memory transport (create window + per-channel events).
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -19,18 +20,31 @@
 #include <span>
 #include <vector>
 
-#include "Protocol.hpp"
+#include "ipc/Protocol.hpp"
 
-// Creates the shared-memory window and per-channel events, then
-// reads requests / writes responses. Mirror of the DLL client (runtime/storage/ShmClient).
-namespace wraith::host::ipc
+// Host side of the shared-memory transport: creates the window and per-channel events, then reads
+// requests and writes responses. The host creates the objects; the client opens them.
+namespace wxl::host::ipc
 {
-    // Create and map the shared window + events. Host owns the objects.
+    /**
+     * @brief Creates and maps the shared window and per-channel events.
+     * @return true on success
+     */
     bool Create();
 
-    // Block until channel `i` has a request; returns the request payload bytes.
+    /**
+     * @brief Blocks until channel `i` has a request and returns its payload bytes.
+     * @param i       channel index
+     * @param reqOut  receives the request payload bytes
+     * @return true if a request was read
+     */
     bool WaitRequest(uint32_t i, std::vector<uint8_t>& reqOut);
 
-    // Write the response payload to channel `i` and signal the client.
+    /**
+     * @brief Writes the response payload to channel `i` and signals the client.
+     * @param i     channel index
+     * @param resp  response payload bytes
+     * @return true if a nonzero-length response was written
+     */
     bool PostResponse(uint32_t i, std::span<const uint8_t> resp);
 }

@@ -1,5 +1,5 @@
-// DLL IPC client: acquire a channel, run one request, resolve/file ops over Protocol.
-// Copyright (C) 2026 WraithEngine
+// DLL IPC client: launch + connect to the asset host, run file ops over the shared-memory mailbox.
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -14,18 +14,18 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-#include "ShmClient.hpp"
+#include "runtime/storage/ShmClient.hpp"
 
-#include "Protocol.hpp"
+#include "events/Event.hpp"
+#include "host/ipc/Protocol.hpp"
 
 #include <flatbuffers/flexbuffers.h>
 
 #include <windows.h>
 #include <atomic>
 #include <mutex>
-#include <unordered_map>
 
-using namespace wraith::ipc;
+using namespace wxl::ipc;
 
 namespace
 {
@@ -40,13 +40,12 @@ namespace
     // --- channel pool: a free channel is acquired per request, then released ---
     std::atomic<bool> g_channelBusy[kChannels] = {}; // false = free
 
-    // --- resolve cache (shared map, guarded by its own mutex; separate from the transport) ---
-    std::mutex g_cacheMutex;
-    std::unordered_map<uint64_t, std::string> g_cache; // request key -> path ("" = known-absent)
-
     constexpr uint32_t kRequestTimeoutMs = 2000;
 
-    // Directory of this module.
+    /**
+     * @brief Returns the directory of this module, i.e. the client root.
+     * @return the module directory, or "." when it cannot be resolved.
+     */
     std::string ModuleDir()
     {
         HMODULE hm = nullptr;
@@ -59,6 +58,9 @@ namespace
         return (slash == std::string::npos) ? std::string(".") : s.substr(0, slash);
     }
 
+    /**
+     * @brief Closes the shared section and every event pair. Caller holds g_connectMutex.
+     */
     void DisconnectLocked()
     {
         g_connected.store(false);
@@ -71,7 +73,10 @@ namespace
         if (g_shm)  { CloseHandle(g_shm); g_shm = nullptr; }
     }
 
-    // Open the shared window and all kChannels event pairs once. Guarded by g_connectMutex.
+    /**
+     * @brief Opens the shared window and all channel event pairs once. Guarded by g_connectMutex.
+     * @return true when connected (or already connected).
+     */
     bool ConnectInner()
     {
         if (g_connected.load()) return true;
@@ -106,8 +111,10 @@ namespace
         return true;
     }
 
-    // Acquire a free channel index (atomic compare-exchange). With kChannels slots and few requester
-    // threads, contention is rare; on a full pool spin/yield briefly and retry.
+    /**
+     * @brief Acquires a free channel index, yielding while the pool is full.
+     * @return the acquired channel index.
+     */
     uint32_t AcquireChannel()
     {
         for (;;)
@@ -123,14 +130,21 @@ namespace
         }
     }
 
+    /**
+     * @brief Releases a channel back to the pool.
+     * @param i  channel index to free.
+     */
     void ReleaseChannel(uint32_t i)
     {
         g_channelBusy[i].store(false, std::memory_order_release);
     }
 
-    // Run one request on channel ch: write payload, bump reqSeq, signal, wait for response. On success the
-    // response is at ChannelPayload(g_base, ch), length = that channel header's respLen. On timeout the
-    // channel is left reusable (the host worker is independent) and false is returned.
+    /**
+     * @brief Runs one request on a channel: write payload, bump reqSeq, signal, wait for response.
+     * @param ch   channel index.
+     * @param req  request payload.
+     * @return true when a response arrives before the timeout.
+     */
     bool SendOnChannel(uint32_t ch, const std::vector<uint8_t>& req)
     {
         if (req.size() > kChannelPayload) return false;
@@ -143,10 +157,15 @@ namespace
         return WaitForSingleObject(g_respEvent[ch], kRequestTimeoutMs) == WAIT_OBJECT_0;
     }
 
-    // Full request round-trip: connect, acquire a free channel, send, and on a well-formed response parse
-    // it via onResponse while the channel is still held (the payload lives in the shared window and is
-    // reused once released). Returns false on connect failure or timeout. The callback is a template so it
-    // inlines with no indirection in the hot file path.
+    /**
+     * @brief Runs a full request round-trip: connect, acquire a channel, send, parse the response.
+     *
+     * The response is parsed while the channel is still held, since the payload lives in the shared
+     * window and is reused once released.
+     * @param req         request payload.
+     * @param onResponse  callback invoked with the response vector on success.
+     * @return true when the request completed.
+     */
     template <class Fn>
     bool Transact(const std::vector<uint8_t>& req, Fn&& onResponse)
     {
@@ -165,8 +184,11 @@ namespace
     }
 }
 
-namespace wraith::runtime::ipc
+namespace wxl::runtime::ipc
 {
+    /**
+     * @brief Launches the asset host if not already running, after firing OnBeforeHostLaunch.
+     */
     void EnsureHostRunning()
     {
         HANDLE existing = OpenFileMappingA(FILE_MAP_READ, FALSE, kShmName);
@@ -174,16 +196,20 @@ namespace wraith::runtime::ipc
 
         std::string root = ModuleDir();
         std::string dir = root + "\\Utils";
-        std::string exe = dir + "\\WraithHost.exe";
+        std::string exe = dir + "\\WarcraftXLHost.exe";
 
-        // Console is opt-in at runtime (not tied to the build): a "WraithConsole.flag" file next to the
-        // client turns the host console on and asks the host to print its per-request lines. Off by default
-        // so a normal run stays windowless and skips the formatting cost.
-        bool console = GetFileAttributesA((root + "\\WraithConsole.flag").c_str()) != INVALID_FILE_ATTRIBUTES;
+        // Let a module observe / veto the launch (e.g. it manages the host itself).
+        bool cancel = false;
+        wxl::events::HostLaunchArgs a{ exe.c_str(), &cancel };
+        wxl::events::Emit(wxl::events::Event::OnBeforeHostLaunch, &a);
+        if (cancel) return;
+
+        // A "WarcraftXLConsole.flag" file next to the client turns the host console on (opt-in at runtime).
+        bool console = GetFileAttributesA((root + "\\WarcraftXLConsole.flag").c_str()) != INVALID_FILE_ATTRIBUTES;
 
         // --client-pid lets the host exit when this client closes; --console enables its console output.
         char cmd[160];
-        wsprintfA(cmd, "WraithHost.exe --client-pid %lu%s", GetCurrentProcessId(), console ? " --console" : "");
+        wsprintfA(cmd, "WarcraftXLHost.exe --client-pid %lu%s", GetCurrentProcessId(), console ? " --console" : "");
 
         STARTUPINFOA si{};
         si.cb = sizeof(si);
@@ -197,6 +223,11 @@ namespace wraith::runtime::ipc
         }
     }
 
+    /**
+     * @brief Polls for the host mailbox until it appears or the timeout elapses.
+     * @param timeoutMs  maximum wait in milliseconds.
+     * @return true if the host mailbox appeared.
+     */
     bool WaitForHost(uint32_t timeoutMs)
     {
         for (uint32_t waited = 0; waited < timeoutMs; waited += 50)
@@ -208,49 +239,17 @@ namespace wraith::runtime::ipc
         return false;
     }
 
-    bool Connect()
-    {
-        return ConnectInner();
-    }
+    /** @brief Opens or reopens the host mailbox. @return true if connected. */
+    bool Connect()     { return ConnectInner(); }
+    /** @brief Reports whether the host mailbox is connected. @return true while connected. */
+    bool IsConnected() { return g_connected.load(); }
 
-    bool IsConnected()
-    {
-        return g_connected.load();
-    }
-
-    std::string Resolve(uint32_t op, uint32_t arg, uint32_t arg2)
-    {
-        const uint64_t key = (static_cast<uint64_t>(op) << 48) |
-                             (static_cast<uint64_t>(arg2 & 0xFFFF) << 32) | arg;
-
-        {
-            std::lock_guard<std::mutex> lock(g_cacheMutex);
-            auto it = g_cache.find(key);
-            if (it != g_cache.end()) return it->second;
-        }
-
-        flexbuffers::Builder fbb;
-        fbb.Vector([&]() { fbb.UInt(op); fbb.UInt(arg); fbb.UInt(arg2); });
-        fbb.Finish();
-
-        std::string result;
-        bool ok = Transact(fbb.GetBuffer(), [&](const flexbuffers::Vector& vec) {
-            if (vec[0].AsUInt32() == StOk) result = vec[1].AsString().str();
-        });
-        if (!ok) return ""; // connect failure / timeout: do not cache
-
-        std::lock_guard<std::mutex> lock(g_cacheMutex);
-        g_cache[key] = result; // cache connected results, incl. ""
-        return result;
-    }
-
-    std::string TexturePath(uint32_t fileDataId) { return Resolve(OpResolveTexture, fileDataId); }
-    std::string ModelPath(uint32_t fileDataId)   { return Resolve(OpResolveModel, fileDataId); }
-    std::string MaterialPath(uint32_t materialResId, uint32_t textureType)
-    {
-        return Resolve(OpResolveMaterial, materialResId, textureType);
-    }
-
+    /**
+     * @brief Opens a file from the host, requesting inline bytes or a shared section.
+     * @param name   archive-relative file name.
+     * @param flags  native open flags.
+     * @return the open result.
+     */
     FileOpenResult FileOpen(const std::string& name, uint32_t flags)
     {
         flexbuffers::Builder fbb;
@@ -270,6 +269,14 @@ namespace wraith::runtime::ipc
         return r;
     }
 
+    /**
+     * @brief Maps the host blob section for an id read-only.
+     * @param id         host blob id.
+     * @param size       section size to map.
+     * @param outView    receives the mapped view.
+     * @param outHandle  receives the section handle.
+     * @return true on success.
+     */
     bool MapBlob(uint32_t id, uint32_t size, void*& outView, void*& outHandle)
     {
         char nm[64];
@@ -283,12 +290,25 @@ namespace wraith::runtime::ipc
         return true;
     }
 
+    /**
+     * @brief Releases a mapping from MapBlob (null-safe).
+     * @param view    mapped view.
+     * @param handle  section handle.
+     */
     void UnmapBlob(void* view, void* handle)
     {
         if (view)   UnmapViewOfFile(view);
         if (handle) CloseHandle(static_cast<HANDLE>(handle));
     }
 
+    /**
+     * @brief Reads up to cap bytes at an offset into dst in one round trip.
+     * @param id   host file id.
+     * @param off  byte offset to read from.
+     * @param dst  destination buffer.
+     * @param cap  maximum bytes to copy (clamped to kFileChunkMax).
+     * @return bytes copied.
+     */
     uint32_t FileReadChunk(uint32_t id, uint32_t off, void* dst, uint32_t cap)
     {
         if (cap > kFileChunkMax) cap = kFileChunkMax;
@@ -308,6 +328,10 @@ namespace wraith::runtime::ipc
         return n;
     }
 
+    /**
+     * @brief Releases a host file id (fire-and-forget).
+     * @param id  host file id.
+     */
     void FileClose(uint32_t id)
     {
         flexbuffers::Builder fbb;
@@ -316,6 +340,11 @@ namespace wraith::runtime::ipc
         Transact(fbb.GetBuffer(), [](const flexbuffers::Vector&) {}); // fire-and-forget release
     }
 
+    /**
+     * @brief Tests whether a file exists in the host archive set.
+     * @param name  archive-relative file name.
+     * @return true if the host reports the file present.
+     */
     bool FileExists(const std::string& name)
     {
         flexbuffers::Builder fbb;

@@ -1,5 +1,5 @@
 // Engine small-block heap allocator / free addresses and their signatures.
-// Copyright (C) 2026 WraithEngine
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -18,8 +18,9 @@
 
 #include <cstdint>
 
-// Engine heap allocator / free entries. Both are callee-cleaned (4 args).
-namespace wraith::offsets::engine::mem
+// INTERNAL to the core. Engine heap allocator / free entries; both callee-cleaned (4 args). Use to
+// allocate buffers the engine will later free itself (and vice versa).
+namespace wxl::offsets::engine::mem
 {
     // Allocate a block: (size, fileName, line, flags) -> pointer (size is rounded up internally).
     constexpr uintptr_t kAlloc = 0x0076E540;

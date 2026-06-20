@@ -1,5 +1,5 @@
-// Map-object root/group/material/visibility entry addresses, signatures, and object field offsets.
-// Copyright (C) 2026 WraithEngine
+// Map-object engine entries (root/group load, material resolve, visibility) and runtime object fields.
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -19,10 +19,11 @@
 #include <cstdint>
 #include <cstddef>
 
-// Map-object engine entries (root/group load, material resolve, visibility) and runtime object fields.
-namespace wraith::offsets::game::wmo
+// INTERNAL to the core. Map-object engine entries (root/group load, material resolve, visibility) and
+// runtime object fields. Modules never include this; they use wxl::game / wxl::events.
+namespace wxl::offsets::game::wmo
 {
-    // --- load (down-convert buffers before the native parse) ---
+    // --- load (rewrite buffers before the native parse) ---
     // Root read-completion callback (root): fires once after the async read fills the root buffer and
     // before the chunk walker runs.
     constexpr uintptr_t kRootComplete = 0x007D8050;

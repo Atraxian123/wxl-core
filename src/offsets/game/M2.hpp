@@ -1,5 +1,5 @@
 // Model load / animation / batch-alpha / ribbon entry addresses, signatures, and object field offsets.
-// Copyright (C) 2026 WraithEngine
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -19,8 +19,9 @@
 #include <cstdint>
 #include <cstddef>
 
-// Model engine entries (load / animation / draw) and the runtime in-memory object field offsets.
-namespace wraith::offsets::game::m2
+// INTERNAL to the core. Client addresses and runtime object field offsets. This is the private
+// SOURCE the game-binding catalog is curated from; modules never include it, they call wxl::game.
+namespace wxl::offsets::game::m2
 {
     // --- load / setup ---
     // Model init: parses a model file and builds the runtime model.
@@ -29,8 +30,8 @@ namespace wraith::offsets::game::m2
     // size their batch blocks. The point to rebuild the material contract a modern skin omits.
     constexpr uintptr_t kFinalizeSkin = 0x00837A40;
 
-    // Version gate: the stock loader accepts only one inner version. Relaxing these two branches lets
-    // it accept the modern inner versions too.
+    // Version-gate branches in the loader. The stock loader accepts only one inner version; these are
+    // the two compare branches that reject higher inner versions.
     constexpr uintptr_t kVersionGateInit = 0x0083CF51; // version-too-high branch
     constexpr uintptr_t kVersionGateAnim = 0x0083C745; // anim-parse version branch
 
@@ -56,9 +57,14 @@ namespace wraith::offsets::game::m2
     // Per-sequence track de-relocator (model, seqIdx, buffer, size): validates the buffer and rebases
     // sequence seqIdx's track inner slots against it, then updates the sequence flags.
     constexpr uintptr_t kPerSeqDeReloc = 0x0083C6E0;
-    // External-anim buffer allocator (size, name, line): allocates size+pad and returns an aligned
-    // pointer carrying a back-shift byte at [ptr-1].
+    // M2 buffer allocator (size, name, line): allocates size+0x10, returns a 16-aligned pointer carrying a
+    // back-shift byte at [ptr-1]. This is the allocator the .m2 load buffer (model+0x150) uses, so a
+    // replacement buffer must come from here for the model destructor's matching free to be valid.
     constexpr uintptr_t kAnimBufferAlloc = 0x0083DE50;
+    constexpr uintptr_t kBufferAlloc     = 0x0083DE50; // alias: same allocator, used for buffer swaps
+    constexpr uintptr_t kBufferFree      = 0x0083DE90; // free a kBufferAlloc pointer (recovers base via [ptr-1])
+    using M2_BufferAllocFn = void*(__cdecl*)(uint32_t size, const char* tag, int line);
+    using M2_BufferFreeFn  = void (__cdecl*)(void* ptr);
 
     // I/O record field offsets used by the rebase: the buffer base and its byte size.
     constexpr size_t kOffRecordBuffer = 0x04;
@@ -72,6 +78,13 @@ namespace wraith::offsets::game::m2
     constexpr uintptr_t kSetupBatchAlpha = 0x0081FE90;
     // Pushes the alpha-test reference to the device.
     constexpr uintptr_t kPushAlphaRef = 0x00873BA0;
+
+    // SetupBatchAlpha draw-context fields (this = the draw context): the instance being drawn and the live
+    // material the caller set. Instance -> model is kOffInstModel below.
+    constexpr size_t kOffDrawCtxInstance = 0x60; // draw context -> render instance
+    constexpr size_t kOffDrawCtxMaterial = 0x98; // draw context -> live material record
+    // Material record: the blend mode (1 = alpha key).
+    constexpr size_t kOffMaterialBlend   = 0x02;
 
     // --- bone palette (per-frame skinning matrices; the bone-physics hook point) ---
     // Per-instance bone-palette build (instance, ...): fills the bone matrices for one instance from
@@ -95,6 +108,10 @@ namespace wraith::offsets::game::m2
     constexpr uintptr_t kTexResolve = 0x004B6CB0;
     // Bind a texture to a sampler selector (device, selector, resolvedTexture).
     constexpr uintptr_t kSamplerBind = 0x00685F50;
+    // Sampler selectors for the engine bind path: s0 = 0x15, consecutive. The native ribbon loop binds
+    // only s0; the extra layers of a multi-texture ribbon are bound to s1/s2 so they survive one pass.
+    constexpr uint32_t kSamplerSelS1 = 0x16;
+    constexpr uint32_t kSamplerSelS2 = 0x17;
 
     // --- runtime instance object fields ---
     constexpr size_t kOffInstModel       = 0x2C; // -> runtime model
@@ -104,7 +121,9 @@ namespace wraith::offsets::game::m2
     // --- runtime model object fields ---
     constexpr size_t kOffModelFlags    = 0x08;  // bit 2 selects the sibling-file open flag
     constexpr size_t kOffModelPathStem = 0x3C;  // model path stem (no extension)
-    constexpr size_t kOffModelHeader   = 0x150; // -> parsed file header
+    constexpr size_t kOffModelHeader   = 0x150; // -> raw .m2 file buffer (parsed in place -> becomes the header)
+    constexpr size_t kOffModelFileSize = 0x16C; // byte size of the .m2 file buffer at +0x150
+    constexpr size_t kOffModelSkin     = 0x170; // -> live parsed skin profile (valid at/after skin finalize)
 
     // --- parsed file-header fields ---
     constexpr size_t kOffHdrGlobalFlags = 0x10; // bit 0x20 = model carries physics
@@ -130,7 +149,7 @@ namespace wraith::offsets::game::m2
     constexpr size_t kOffRuntimeBoneAnimIdx   = 0x44;
 
     // --- ribbon-emitter object fields ---
-    constexpr size_t kOffRibbonLayerCount  = 0x118; // draw-loop bound
+    constexpr size_t kOffRibbonLayerCount   = 0x118; // draw-loop bound
     constexpr size_t kOffRibbonTexHandlePtr = 0x12C; // -> per-layer texture-handle array (stride 4)
 
     // --- signatures ---

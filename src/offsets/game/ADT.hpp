@@ -1,5 +1,5 @@
-// Terrain tile/chunk lookup entry addresses, the tile-slot grid, and runtime chunk field offsets.
-// Copyright (C) 2026 WraithEngine
+// Terrain tile/chunk lookups, the tile-slot grid, and runtime in-memory chunk field offsets.
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -19,13 +19,18 @@
 #include <cstdint>
 #include <cstddef>
 
-// Terrain tile/chunk lookups, the tile-slot grid, and runtime in-memory chunk field offsets.
-namespace wraith::offsets::game::adt
+// INTERNAL to the core. Terrain tile/chunk lookups, the tile-slot grid, and runtime in-memory chunk
+// field offsets. Modules never include this; they use wxl::game / wxl::events.
+namespace wxl::offsets::game::adt
 {
     // --- lookups ---
     // Chunk lookup (pos) -> runtime chunk object, or null when that chunk is not parsed yet. A non-null
     // result means the chunk heightmap + collision are resident.
     constexpr uintptr_t kGetChunk = 0x007B49C0;
+    // CMapChunk::Build (this=CMapChunk in ECX): turns one raw MCNK into a live chunk (sub-chunk pointers,
+    // bbox, texture-layer units, ref spawn). The "a terrain chunk was built" point, distinct from the
+    // per-frame terrain draw.
+    constexpr uintptr_t kChunkBuild = 0x007C64B0;
     // Near-tile placed-object counter (chunk, &progress, total) -> count of placed-object children still
     // loading that overlap the chunk box.
     constexpr uintptr_t kNearObjectCount = 0x007B50B0;
@@ -45,10 +50,17 @@ namespace wraith::offsets::game::adt
 
     // --- runtime chunk object fields ---
     constexpr size_t kOffChunkNodeLayerCount = 0x09; // draw-node layer count
+    // CMapChunk -> MCNK 128-byte data header (= raw MCNK ptr + 8-byte tag). The authoritative texture-layer
+    // count (SMChunk.nLayers, 0..4) lives at header + 0x0C.
+    constexpr size_t kOffChunkMcnkHeader = 0x110;
+    constexpr size_t kOffMcnkNLayers     = 0x0C;
 
     // --- signatures ---
     // Chunk lookup (pos on stack) -> chunk object.
     using Map_GetChunkFn = void*(__cdecl*)(float* pos);
     // Near-object counter (chunk, progressOut, total) -> count.
     using Map_NearObjectCountFn = int(__cdecl*)(void* chunk, int* progressOut, int total);
+    // CMapChunk::Build: native this-in-ECX (__thiscall, ret 8). Declared __fastcall with a dummy EDX so the
+    // trampoline routes the chunk into the this-register and keeps the two stack args.
+    using Map_ChunkBuildFn = void(__fastcall*)(void* chunk, void* edx, void* rawMcnk, int param2);
 }

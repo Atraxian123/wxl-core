@@ -1,4 +1,5 @@
-// Copyright (C) 2026 WraithEngine
+// File log, always on.
+// Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -15,22 +16,28 @@
 
 #pragma once
 
-// The file log is always on, Release included.
-// Console output (host) is compiled out under NDEBUG.
-namespace wraith::core::log
+/// File log, always on, Release included.
+namespace wxl::core::log
 {
-    // Open the log file at the given path. Idempotent.
+    /**
+     * @brief Opens the log file at the given path. Idempotent.
+     * @param path  filesystem path of the log file.
+     */
     void Open(const char* path);
 
-    // Append one formatted line. Thread-safe.
+    /**
+     * @brief Appends one formatted line. Thread-safe.
+     * @param fmt  printf-style format string followed by its arguments.
+     */
     void Printf(const char* fmt, ...);
 
-    // Flush and close the log file.
+    /** 
+     * @brief Flushes and closes the log file.
+     */
     void Close();
 }
 
-// Convenience record macros (level tag + the shared file log). Used across the host and the
-// shared decoder sources. All levels go to the same file; the tag is informational.
-#define WLOG_INFO(...)  ::wraith::core::log::Printf(__VA_ARGS__)
-#define WLOG_WARN(...)  ::wraith::core::log::Printf(__VA_ARGS__)
-#define WLOG_ERROR(...) ::wraith::core::log::Printf(__VA_ARGS__)
+// Record macros. All levels go to the same file; the tag is informational.
+#define WLOG_INFO(...)  ::wxl::core::log::Printf(__VA_ARGS__)
+#define WLOG_WARN(...)  ::wxl::core::log::Printf(__VA_ARGS__)
+#define WLOG_ERROR(...) ::wxl::core::log::Printf(__VA_ARGS__)
