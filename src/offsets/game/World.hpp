@@ -137,6 +137,11 @@ namespace wxl::offsets::game::world
     constexpr uintptr_t kAsyncServiceQueues = 0x004B9B20;
     using AsyncServiceQueuesFn = int(__cdecl*)();
 
+    // Cancel + recycle an in-flight async read object: unlinks it from the completed queue so its
+    // completion never runs. Used to retire a chunk's pending read before its buffer is freed.
+    constexpr uintptr_t kAsyncDestroy = 0x004B9DE0;
+    using AsyncDestroyFn = void(__cdecl*)(void* asyncObj);
+
     // --- signatures ---
     // World tick + drain (param on stack).
     using World_TickFn = void(__cdecl*)(int param);
