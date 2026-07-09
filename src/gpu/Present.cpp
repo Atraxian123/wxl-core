@@ -63,6 +63,12 @@ namespace
     IDirect3DDevice9On12* g_on12 = nullptr;
     IDirect3DDevice9*     g_dev9 = nullptr;
 
+    // Single-sample texture the engine's MSAA backbuffer resolves into before the blit (composition swapchains
+    // are single-sample, so a multisampled backbuffer cannot be sampled/copied directly). Created on demand.
+    ID3D12Resource* g_resolveTex  = nullptr;
+    UINT            g_resolveW    = 0, g_resolveH = 0;
+    DXGI_FORMAT     g_resolveFmt  = DXGI_FORMAT_UNKNOWN;
+
     static const char* k_blitHLSL =
         "Texture2D    src : register(t0);\n"
         "SamplerState smp : register(s0);\n"
@@ -245,6 +251,40 @@ namespace
         b.Transition.StateAfter  = to;
         g_list->ResourceBarrier(1, &b);
     }
+
+    /**
+     * @brief Creates (or resizes) the single-sample texture the engine's MSAA backbuffer resolves into.
+     * @param dev  the shared D3D12 device.
+     * @param w    backbuffer width.
+     * @param h    backbuffer height.
+     * @param fmt  backbuffer format (the resolve target matches it).
+     * @return true when the resolve texture is ready at the requested size/format.
+     */
+    bool EnsureResolveTex(ID3D12Device* dev, UINT w, UINT h, DXGI_FORMAT fmt)
+    {
+        if (!dev) return false;
+        if (g_resolveTex && g_resolveW == w && g_resolveH == h && g_resolveFmt == fmt) return true;
+        if (g_resolveTex) { g_resolveTex->Release(); g_resolveTex = nullptr; }
+
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width            = w;
+        rd.Height           = h;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels        = 1;
+        rd.Format           = fmt;
+        rd.SampleDesc.Count = 1;
+        rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        rd.Flags            = D3D12_RESOURCE_FLAG_NONE;
+        HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                  D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_resolveTex));
+        if (FAILED(hr)) { Log("present: MSAA resolve tex %ux%u fmt=%d failed hr=0x%08lX", w, h, (int)fmt, hr); g_resolveTex = nullptr; return false; }
+        g_resolveW = w; g_resolveH = h; g_resolveFmt = fmt;
+        Log("present: MSAA resolve tex %ux%u fmt=%d ready", w, h, (int)fmt);
+        return true;
+    }
 }
 
 namespace wxl::gpu::present
@@ -275,11 +315,21 @@ namespace wxl::gpu::present
         D3D12_RESOURCE_DESC d = bb12->GetDesc();
         const UINT w = (UINT)d.Width, h = d.Height;
         const DXGI_FORMAT srcFmt = d.Format;
-        if (d.SampleDesc.Count > 1)   // MSAA backbuffer: the single-sample blit path does not cover it yet.
+        // MSAA backbuffer (the engine's native multisampling): the composition swapchain is single-sample
+        // (flip-model), so the multisampled backbuffer cannot be sampled by the blit -- resolve it into a
+        // single-sample texture first and blit that. Without this the present bailed and the native windowed
+        // present (which DWM does not composite) left the window white.
+        const bool      msaa    = (d.SampleDesc.Count > 1);
+        ID3D12Resource* blitSrc = bb12;
+        if (msaa)
         {
-            g_on12->ReturnUnderlyingResource(surf, 0, nullptr, nullptr);
-            bb12->Release(); surf->Release();
-            return false;
+            if (!EnsureResolveTex(wxl::gpu::Device(), w, h, srcFmt))
+            {
+                g_on12->ReturnUnderlyingResource(surf, 0, nullptr, nullptr);
+                bb12->Release(); surf->Release();
+                return false;
+            }
+            blitSrc = g_resolveTex;
         }
 
         // The swapchain matches the window client size. The On12 backbuffer is pinned to that same native size
@@ -322,7 +372,7 @@ namespace wxl::gpu::present
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         sv.Texture2D.MipLevels = 1;
-        dev->CreateShaderResourceView(bb12, &sv, srvCpu);
+        dev->CreateShaderResourceView(blitSrc, &sv, srvCpu);
         D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = g_srvHeap->GetGPUDescriptorHandleForHeapStart();
         srvGpu.ptr += (UINT64)slot * g_srvInc;
 
@@ -336,7 +386,16 @@ namespace wxl::gpu::present
         g_alloc->Reset();
         g_list->Reset(g_alloc, nullptr);
 
-        Barrier(bb12,   D3D12_RESOURCE_STATE_COMMON,  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (msaa)
+        {
+            // Resolve the multisampled backbuffer into the single-sample blit source.
+            Barrier(bb12,         D3D12_RESOURCE_STATE_COMMON,       D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+            Barrier(g_resolveTex, D3D12_RESOURCE_STATE_COMMON,       D3D12_RESOURCE_STATE_RESOLVE_DEST);
+            g_list->ResolveSubresource(g_resolveTex, 0, bb12, 0, srcFmt);
+            Barrier(g_resolveTex, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        else
+            Barrier(bb12, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         Barrier(swapBB, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
         ID3D12DescriptorHeap* heaps[] = { g_srvHeap };
@@ -354,8 +413,14 @@ namespace wxl::gpu::present
         g_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_list->DrawInstanced(3, 1, 0, 0);
 
-        Barrier(swapBB, D3D12_RESOURCE_STATE_RENDER_TARGET,        D3D12_RESOURCE_STATE_PRESENT);
-        Barrier(bb12,   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(swapBB, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+        if (msaa)
+        {
+            Barrier(g_resolveTex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(bb12,         D3D12_RESOURCE_STATE_RESOLVE_SOURCE,        D3D12_RESOURCE_STATE_COMMON);
+        }
+        else
+            Barrier(bb12, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         g_list->Close();
 
         ID3D12CommandList* lists[] = { g_list };

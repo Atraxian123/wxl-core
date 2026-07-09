@@ -219,14 +219,14 @@ namespace
 
     // A depth-stencil that is also shader-readable, single-sample only.
     const D3DFORMAT    kFmtINTZ = static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z'));
-    IDirect3DTexture9* g_ssaaColorTex  = nullptr;      // render-size world color TEXTURE (supersampling on)
+    IDirect3DTexture9* g_ssaaColorTex  = nullptr;      // render-size world color TEXTURE (render scale on)
     IDirect3DSurface9* g_ssaaColor     = nullptr;      // its level-0 surface, bound as the world render target
     IDirect3DTexture9* g_worldDepthTex = nullptr;      // render-size sampleable depth texture
     IDirect3DSurface9* g_worldDepth    = nullptr;      // its level-0 surface, bound as the world depth-stencil
     void*              g_targetDevice  = nullptr;      // device the offscreen surfaces belong to
     UINT g_nativeW = 0, g_nativeH = 0;                 // native backbuffer size
-    UINT g_renderW = 0, g_renderH = 0;                 // offscreen render size (native * renderScale)
-    bool g_hasColor = false;                           // a color render target exists (supersampling on)
+    UINT g_renderW = 0, g_renderH = 0;                 // offscreen render size (native * renderScale, up or down)
+    bool g_hasColor = false;                           // a color render target exists (render scale != 100%)
     bool g_readableDepth = false;                      // the depth is the sampleable format vs a plain depth-stencil
     bool g_colorRedirect = false;                      // armed: redirect the color bind to g_ssaaColor
     bool g_depthRedirect = false;                      // armed: redirect the depth bind to g_worldDepth
@@ -340,9 +340,11 @@ namespace
 
     /**
      * @brief Creates (or recreates on change) the world depth (INTZ + sampleable when readable, else a plain
-     *        depth-stencil) plus the color render target when makeColor (supersampling). Render size =
-     *        native * renderScale. Supersampling alone uses a plain depth; INTZ is created only when a depth
-     *        effect needs to sample it.
+     *        depth-stencil) plus the color render target when makeColor (render scale != 100%). Render size =
+     *        native * renderScale (up OR down). Render scale alone uses a plain depth; INTZ is created only when
+     *        a depth effect needs to sample it. The targets are always single-sample; under engine MSAA the
+     *        in-world pass still renders the world into them (its post-process becomes the AA, see SsaaArmFrame)
+     *        while the glue pass bails (GlueArm).
      */
     bool EnsureTargets(IDirect3DDevice9* dev, UINT nativeW, UINT nativeH, float renderScale, bool makeColor, bool readable, D3DFORMAT colorFmt, D3DFORMAT depthFmt)
     {
@@ -401,13 +403,13 @@ namespace
     void SsaaArmFrame()
     {
         const float factor  = WxlGetSsaaFactor();
-        const bool  ssaaOn  = factor > 1.01f;
-        // The SSAA/depth redirect is in-world ONLY: it relies on the world pass clearing + rendering into the
-        // offscreen and on the world hook resolving it back. The glue screens (login / character select) have no
-        // such world pass, so redirecting there would send the glue 3D into the offscreen with nothing to resolve
-        // it (black screen). g_worldActive (set by the world hook this frame) gates it. Post-process AA still runs
-        // on glue via the general UI-quad boundary, sampling the backbuffer directly.
-        const bool  active  = (ssaaOn || g_depthNeeded) && g_worldActive;
+        const bool  scaleOn = (factor < 0.995f || factor > 1.005f);   // render scale active, downscale OR upscale
+        // The render-scale/depth redirect is in-world ONLY: it relies on the world pass clearing + rendering into
+        // the offscreen and on the world hook resolving it back. The glue screens (login / character select) have
+        // no such world pass, so redirecting there would send the glue 3D into the offscreen with nothing to
+        // resolve it (black screen). g_worldActive (set by the world hook this frame) gates it. Post-process AA
+        // still runs on glue via the general UI-quad boundary, sampling the backbuffer directly.
+        const bool  active  = (scaleOn || g_depthNeeded) && g_worldActive;
         if (!active) { g_colorRedirect = g_depthRedirect = false; return; }
 
         IDirect3DDevice9* dev = static_cast<IDirect3DDevice9*>(gx::RawDevice());
@@ -421,15 +423,16 @@ namespace
         bb->GetDesc(&cd);
         bb->Release();
 
-        // Engine MSAA: the redirect is incompatible -- a single-sample offscreen color (supersampling) or a
-        // single-sample readable depth (ambient occlusion) cannot pair with a multisampled world target, and the
-        // post-process passes multisampled frames through untouched. Leave the native targets in place so the
-        // engine's own multisampling is the anti-aliasing.
-        if (cd.MultiSampleType != D3DMULTISAMPLE_NONE)
-        {
-            g_colorRedirect = g_depthRedirect = false;
-            return;
-        }
+        // Engine MSAA: the world is redirected into our SINGLE-SAMPLE offscreen instead of the engine's
+        // multisampled world target, so render scale and a sampleable INTZ depth (ambient occlusion) work under
+        // MSAA too -- the world is rendered single-sample and our post-process becomes its anti-aliasing. The
+        // color and depth must both be single-sample to pass D3D9's render-target/depth-stencil match, so under
+        // MSAA the color is redirected whenever the depth is (even at 100% scale). D3D9 cannot StretchRect a
+        // frame INTO the multisampled backbuffer, so the world->UI boundary hands the offscreen to the module as
+        // the supersample source and its pipeline downsamples it onto the MSAA backbuffer (see hkWorldFinalize).
+        // PPAA-only (no scale, no depth) does not reach here (active is false), so the world stays in the MSAA
+        // backbuffer and the module resolves it directly.
+        const bool msaa = (cd.MultiSampleType != D3DMULTISAMPLE_NONE);
 
         // Plain depth format taken from the native depth surface (ignored when the sampleable format is used).
         D3DFORMAT depthFmt = D3DFMT_D24X8;
@@ -439,11 +442,12 @@ namespace
             if (SUCCEEDED(nd->GetDesc(&dd))) depthFmt = dd.Format;
         }
 
-        // Color is redirected only for supersampling; a depth-only frame keeps the native color and redirects
-        // the depth alone. The depth uses the sampleable format when a depth-using effect is enabled.
-        const bool  makeColor   = ssaaOn;
+        // Color is redirected for any render scale != 100%; a depth-only frame normally keeps the native color
+        // and redirects the depth alone. Under MSAA the color must be redirected too whenever the depth is, so
+        // the single-sample offscreen color matches the single-sample INTZ depth.
         const bool  readable    = g_depthNeeded;
-        const float renderScale = ssaaOn ? factor : 1.0f;
+        const bool  makeColor   = scaleOn || (msaa && readable);
+        const float renderScale = scaleOn ? factor : 1.0f;
         if (!EnsureTargets(dev, cd.Width, cd.Height, renderScale, makeColor, readable, cd.Format, depthFmt))
         {
             g_colorRedirect = g_depthRedirect = false;
@@ -504,6 +508,7 @@ namespace
         // redirect and restore the native render target, depth, and viewport so the UI draws at native resolution.
         const bool colorR = g_colorRedirect;
         const bool depthR = g_depthRedirect;
+        void* superSampleForEvent = nullptr;
         if (colorR || depthR)
         {
             g_colorRedirect = g_depthRedirect = false;
@@ -514,11 +519,18 @@ namespace
                 IDirect3DSurface9* bb = nullptr;
                 if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb)
                 {
-                    // Resolve the render-size world color down onto the native backbuffer. A linear-filtered
-                    // StretchRect from the 2x surface is the supersampling box-downsample (a 2x2 average for an
-                    // integer 2x factor); the On12 proxy handles this surface->backbuffer blit reliably. The UI
-                    // then draws at native resolution over the resolved frame.
-                    dev->StretchRect(g_ssaaColor, nullptr, bb, nullptr, D3DTEXF_LINEAR);
+                    D3DSURFACE_DESC bd{};
+                    bb->GetDesc(&bd);
+                    if (bd.MultiSampleType == D3DMULTISAMPLE_NONE)
+                        // Single-sample backbuffer: resolve the render-size world color straight onto it. A
+                        // linear StretchRect scales it to native (box-downsample above 100%, bilinear upscale
+                        // below); the On12 proxy handles this surface->backbuffer blit reliably.
+                        dev->StretchRect(g_ssaaColor, nullptr, bb, nullptr, D3DTEXF_LINEAR);
+                    else
+                        // MSAA backbuffer: StretchRect cannot target a multisampled surface, so hand the
+                        // (single-sample) world offscreen to the module as the supersample source -- its pipeline
+                        // downsamples it and draws the result into the MSAA backbuffer.
+                        superSampleForEvent = static_cast<void*>(g_ssaaColor);
                     g_origSetRT(dev, 0, bb);
                     bb->Release();
                 }
@@ -534,13 +546,12 @@ namespace
             }
         }
 
-        // The core already resolved supersampling onto the backbuffer (the StretchRect above), so the module is
-        // handed a null supersample source for plain SSAA -- it has nothing to do. depthSource is the sampleable
-        // world depth, passed when a depth-using effect (ambient occlusion) asked for it, so the module can run
-        // its D3D12 pass. (A post-process AA effect -- FXAA / CMAA / SMAA -- will instead take over the resolve:
-        // the core hands it g_ssaaColor and skips the StretchRect, so the shader does the downsample + AA.)
+        // superSampleForEvent is null when the core already resolved the world onto a single-sample backbuffer
+        // (StretchRect above) -- the module then just runs the effect chain on the backbuffer. Under MSAA it is
+        // g_ssaaColor: the module downsamples that single-sample world offscreen and draws it into the MSAA
+        // backbuffer (StretchRect cannot). depthSource is the sampleable world depth for a depth-using effect.
         ev::WorldRenderEndArgs a{ gx::RawDevice(),
-                                  nullptr,
+                                  superSampleForEvent,
                                   colorR ? WxlGetSsaaFactor() : 1.0f,
                                   (depthR && g_readableDepth) ? static_cast<void*>(g_worldDepth) : nullptr,
                                   nullptr };   // in-world the subscriber reads the live world camera projection
@@ -553,19 +564,21 @@ namespace
      *        and drives its viewport through the engine curWindow rect (the same path the world uses), so binding
      *        the offscreen here and scaling curWindow makes the glue scene rasterize at render size; GlueResolve
      *        resolves it back at the boundary. Two independent arms, like the world:
-     *          - supersampling (factor > 1): redirect the color into a render-size offscreen + scale curWindow.
+     *          - render scale (factor != 1): redirect the color into a render-size offscreen + scale curWindow.
      *            Unlike the world (which clears the whole frame into the offscreen), the glue pass renders the
-     *            model into a sub-rect with no full-frame clear, so the current backbuffer is copied (upscaled)
+     *            model into a sub-rect with no full-frame clear, so the current backbuffer is copied (re-scaled)
      *            into the offscreen first, and the full-frame resolve preserves the 2D backdrop.
-     *          - depth-using effect (ambient occlusion): bind a sampleable INTZ depth (render-size with
-     *            supersampling, else native) so the glue model writes a depth the module can sample.
-     *        Sets g_colorRedirect / g_depthRedirect. Returns true when anything was armed (no engine MSAA).
+     *          - depth-using effect (ambient occlusion): bind a sampleable INTZ depth (render-size with render
+     *            scale, else native) so the glue model writes a depth the module can sample.
+     *        Sets g_colorRedirect / g_depthRedirect. Returns true when anything was armed. Engine MSAA bails:
+     *        the glue arm seeds the offscreen via StretchRect, which cannot target a multisampled surface, so
+     *        render scale is not offered on the glue screens under MSAA (the engine's own MSAA still applies).
      */
     bool GlueArm()
     {
-        const float factor = WxlGetSsaaFactor();
-        const bool  ssaaOn = factor > 1.01f;
-        if (!ssaaOn && !g_depthNeeded) return false;   // nothing to do: plain post-process AA samples the bb
+        const float factor  = WxlGetSsaaFactor();
+        const bool  scaleOn = (factor < 0.995f || factor > 1.005f);
+        if (!scaleOn && !g_depthNeeded) return false;   // nothing to do: plain post-process AA samples the bb
 
         IDirect3DDevice9* dev  = static_cast<IDirect3DDevice9*>(gx::RawDevice());
         uint8_t*          base = GxBase();
@@ -576,7 +589,8 @@ namespace
         if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return false;
         D3DSURFACE_DESC cd{};
         bb->GetDesc(&cd);
-        // Engine MSAA: a single-sample offscreen / readable depth cannot pair with a multisampled target.
+        // Engine MSAA: the glue seed (StretchRect bb -> offscreen) cannot write a multisampled surface, so the
+        // glue redirect bails and the engine's own multisampling stays the anti-aliasing here.
         if (cd.MultiSampleType != D3DMULTISAMPLE_NONE) { bb->Release(); return false; }
 
         D3DFORMAT depthFmt = D3DFMT_D24X8;
@@ -586,9 +600,9 @@ namespace
             if (SUCCEEDED(nd->GetDesc(&dd))) depthFmt = dd.Format;
         }
 
-        const bool  makeColor   = ssaaOn;        // color offscreen only for supersampling
+        const bool  makeColor   = scaleOn;       // color offscreen for any render scale != 100%
         const bool  readable    = g_depthNeeded; // sampleable INTZ depth only for a depth-using effect
-        const float renderScale = ssaaOn ? factor : 1.0f;
+        const float renderScale = scaleOn ? factor : 1.0f;
         if (!EnsureTargets(dev, cd.Width, cd.Height, renderScale, makeColor, readable, cd.Format, depthFmt))
         {
             bb->Release();
