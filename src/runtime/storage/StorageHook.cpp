@@ -21,7 +21,6 @@
 #include "core/Hook.hpp"
 #include "core/Logger.hpp"
 #include "offsets/engine/Io.hpp"
-#include "runtime/adt/Adt.hpp"
 
 #include <windows.h>
 #include <cctype>
@@ -99,6 +98,12 @@ namespace
     std::vector<wxl::runtime::storage::ClientProvideFn>& ClientProviders()
     {
         static std::vector<wxl::runtime::storage::ClientProvideFn> v;
+        return v;
+    }
+
+    std::vector<wxl::runtime::storage::ServeFilterFn>& ServeFilters()
+    {
+        static std::vector<wxl::runtime::storage::ServeFilterFn> v;
         return v;
     }
 
@@ -264,13 +269,14 @@ namespace
             mode = "stream";
         }
 
-        // A served ADT carries a trailing ATSC texture-scale table; record it and trim it off so
-        // the native loader sees only the ADT bytes.
+        // Served-bytes filters: a module may record trailing side tables (ATSC/ATHB/ATL2, ...) and
+        // trim them off so the native loader sees only the bytes it understands.
         if (ok && f->buffer && f->size)
-        {
-            const uint32_t served = wxl::runtime::adt::IngestAdtBytes(hostName.c_str(), f->buffer, f->size);
-            if (served < f->size) f->size = served;
-        }
+            for (wxl::runtime::storage::ServeFilterFn filter : ServeFilters())
+            {
+                const uint32_t served = filter(hostName.c_str(), f->buffer, f->size);
+                if (served < f->size) f->size = served;
+            }
 
         if (ok)
         {
@@ -570,5 +576,10 @@ namespace wxl::runtime::storage
     void RegisterClientProvider(ClientProvideFn fn)
     {
         if (fn) ClientProviders().push_back(fn);
+    }
+
+    void RegisterServeFilter(ServeFilterFn fn)
+    {
+        if (fn) ServeFilters().push_back(fn);
     }
 }
