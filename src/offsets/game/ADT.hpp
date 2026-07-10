@@ -119,6 +119,76 @@ namespace wxl::offsets::game::adt
     constexpr size_t kOffTexOwnerHandleArray = 0x60;
     constexpr size_t kTexOwnerHandleStride   = 0x08;
 
+    // --- terrain height blend ---
+    // Shader-path per-chunk draw signature: native this-in-ECX, no stack args. Declared __fastcall
+    // with a dummy EDX so the trampoline routes the chunk into the this-register.
+    using Map_SurfaceChunkDrawShaderFn = void(__fastcall*)(void* chunkObj, void* edx);
+    // By-name map texture loader: builds the wrap/filter flag set and creates the texture handle.
+    // Returns the texture handle, 0 on failure. Content streams in asynchronously.
+    constexpr uintptr_t kMapLoadTexture = 0x007D9990;
+    using Map_LoadTextureFn = void*(__cdecl*)(const char* filename);
+    // First free sampler selector on the terrain draw (s9 = selector 0x1E); s9..s15 stay engine-free
+    // there (selectors 0x1E..0x24 map linearly to s9..s15). The first pass binds its four height
+    // textures at s9..s12; the extra-layer second pass splits the same range: extras' heights at
+    // s9..s11, the natives' combined alpha at s12, and the natives' heights at s13..s15.
+    constexpr uint32_t kSamplerSelHeight0     = 0x1E;
+    constexpr uint32_t kSamplerSelNativeAlpha = 0x21; // s12 in the second pass
+    constexpr uint32_t kSamplerSelNativeH0    = 0x22; // s13..s15 in the second pass
+    constexpr uint32_t kSamplerSelFreeCount   = 7;    // 0x1E..0x24 = s9..s15
+    // First engine-free terrain pixel-shader constant: c13..c16 = per-layer (heightScale, heightOffset)
+    // in the first pass. The second pass extends the range: c13..c15 = extras' pairs, c16..c19 = the
+    // natives' pairs, c20 = the natives' UV-tiling ratios relative to the pass draw's layer 0.
+    constexpr uint32_t kPsConstHeightBase      = 13;
+    constexpr uint32_t kPsConstNativeHeight    = 16;
+    constexpr uint32_t kPsConstNativeUvRatio   = 20;
+    constexpr uint32_t kPsConstSecondPassCount = 8; // c13..c20 uploaded as one block
+    // Signatures for kTexResolve / kSetSamplerTexture above.
+    using Map_TexResolveFn  = void*(__cdecl*)(void* handle, int a, int b);
+    using Map_SamplerBindFn = void(__fastcall*)(void* device, void* edx, uint32_t selector, void* tex);
+
+    // --- terrain extra-layer second pass (layers 5..8) ---
+    // Draw-node fields the second blended draw mutates and restores around the redraw. The draw leaf
+    // (kSurfaceChunkDrawShader) never writes the node, so a mutate/redraw/restore inside a detour on
+    // it is safe; the leaf re-runs the VS pick and full constant upload each call.
+    constexpr size_t kOffChunkNodeFlags   = 0x0A; // u16: bit0 = mask-family layer, bit2 = cube-env layer
+    constexpr size_t kOffChunkNodeChunk   = 0x10; // CMapChunk* backing the node
+    constexpr size_t kOffChunkNodeAlphaRT = 0x84; // combined alpha texture handle bound at s(nLayers)
+    // Layer record fields (record = node + kOffChunkLayerRecords + i*kChunkLayerRecordStride).
+    constexpr size_t kOffLayerSlotFlags = 0x00;   // u16 MCLY flags low word (anim dir/speed/animate)
+    constexpr size_t kOffLayerSlotIndex = 0x02;   // u16 slot index (0..3)
+    constexpr size_t kOffLayerSlotTexId = 0x08;   // u32 MCLY textureId (dedup key only at draw time)
+    constexpr size_t kOffLayerSlotAlpha = 0x0C;   // per-layer alpha handle; 0 on the shader path
+    constexpr size_t kOffLayerSlotNode  = 0x10;   // back-pointer to the node
+    // CMapChunk identity fields (engine-written, not data-trusted).
+    constexpr size_t kOffMapChunkIndexX  = 0x24;  // local 0..15 (MCIN slot = y*16 + x)
+    constexpr size_t kOffMapChunkIndexY  = 0x28;
+    constexpr size_t kOffMapChunkGlobalX = 0x34;  // tileX*16 + localX (0..1023)
+    constexpr size_t kOffMapChunkGlobalY = 0x38;
+    // In-memory terrain texture create: builds linear/clamp flags and creates a callback-filled
+    // texture handle. The fill callback is invoked by the texture system with op==1 and must write
+    // *outBase / *outStride; the creation ctx arrives as its 6th argument (stride at arg 7, base at
+    // arg 8, byte-verified against the native terrain fill callback).
+    constexpr uintptr_t kAllocTerrainTexture = 0x007B7A70;
+    using Map_AllocTerrainTextureFn = void*(__cdecl*)(uint32_t w, uint32_t h, void* ctx, void* callback,
+                                                      uint32_t fmt, uint32_t fmt2);
+    using Map_TexFillCallbackFn = void(__cdecl*)(int op, uint32_t w, uint32_t h, uint32_t a4,
+                                                 uint32_t a5, void* ctx, uint32_t* outStride,
+                                                 const void** outBase);
+    constexpr uint32_t kTexFormatArgb8888 = 2;
+    // Texture handle release (pairs with kAllocTerrainTexture / kMapLoadTexture).
+    constexpr uintptr_t kTextureRelease = 0x0047BF30;
+    using TextureReleaseFn = void(__cdecl*)(void* handle);
+    // Global render-state setter (id, value): master-gated, writes the state cell + marks it dirty;
+    // the next draw's state sync flushes it to the device.
+    constexpr uintptr_t kGxRsSetInt = 0x00408BF0;
+    using GxRsSetIntFn = void(__cdecl*)(int id, int value);
+    constexpr int kGxRsBlend    = 6; // blend mode enum; 0 = opaque, 2 = srcAlpha / invSrcAlpha
+    constexpr int kGxRsAlphaRef = 7; // alpha-test ref; 0 = off, 1 = discard zero-coverage pixels
+    // Shadow tier getter (0 = no shadow). Tier 0 pairs the terrain PS with the unpacked-texcoord VS
+    // family; tiers 1..3 pair with the packed family (layer 2/3 uvs share one texcoord register).
+    constexpr uintptr_t kShadowTierGetter = 0x00873FF0;
+    using ShadowTierGetterFn = int(__cdecl*)();
+
     // --- terrain per-layer UV scale ---
     // Builds the per-chunk terrain shader constant block (the 37 vec4s) and uploads it. c18..c21 are the
     // four per-layer UV-tiling vec4s. Post-hooked to divide each drawn layer's c18+i.xy by its texture's
