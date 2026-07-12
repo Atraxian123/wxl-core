@@ -18,7 +18,10 @@
 
 #include "core/Logger.hpp"
 
+#include <cctype>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace wxl::host
@@ -175,6 +178,48 @@ namespace wxl::host
     void SetClientRoot(std::string_view root) { ClientRootRef().assign(root); }
     /** @brief Returns the client data root. */
     std::string ClientRoot() { return ClientRootRef(); }
+
+    namespace
+    {
+        /** @brief Lowercases and swaps '/' for '\\' so two spellings of the same path compare equal. */
+        std::string NormalizeTexturePath(std::string_view path)
+        {
+            std::string s(path);
+            for (char& c : s)
+            {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (c == '/') c = '\\';
+            }
+            return s;
+        }
+
+        /** @brief Guards ModernTextureSet(). */
+        std::mutex& ModernTextureMutex() { static std::mutex m; return m; }
+        /** @brief Returns the process-wide set of modern-sourced texture paths. */
+        std::unordered_set<std::string>& ModernTextureSet() { static std::unordered_set<std::string> s; return s; }
+    }
+
+    /**
+     * @brief Marks a texture path as referenced by a modern (non-native) source.
+     * @param path  texture path, as returned by a FileDataID resolver
+     */
+    void MarkModernTexture(std::string_view path)
+    {
+        std::lock_guard<std::mutex> lock(ModernTextureMutex());
+        ModernTextureSet().insert(NormalizeTexturePath(path));
+    }
+
+    /**
+     * @brief Reports whether a texture path was marked as referenced by a modern source.
+     * @param path  texture path queried
+     * @return true if the path was marked
+     */
+    bool IsModernTexture(std::string_view path)
+    {
+        std::lock_guard<std::mutex> lock(ModernTextureMutex());
+        const auto& set = ModernTextureSet();
+        return set.find(NormalizeTexturePath(path)) != set.end();
+    }
 
     /**
      * @brief Returns the total number of registered hooks across all hook points.

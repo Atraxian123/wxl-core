@@ -165,6 +165,25 @@ namespace wxl::host
      */
     std::string ClientRoot();
 
+    // --- texture provenance (cold boundary; a resolver call site marks a texture path it just resolved for
+    //     a modern M2/WMO/ADT source, so a byte-transform that must not touch native content -- e.g. the BLP
+    //     size cap -- can scope itself to modern-sourced textures instead of every texture the client opens)
+    //     ---
+
+    /**
+     * @brief Marks a texture path as referenced by a modern (non-native) source. Idempotent.
+     * @param path  texture path, as returned by a FileDataID resolver
+     */
+    void MarkModernTexture(std::string_view path);
+
+    /**
+     * @brief Reports whether a texture path was marked as referenced by a modern source.
+     * @param path  texture path queried, in whatever form the caller has it (matched case/separator
+     *              insensitively against every path passed to MarkModernTexture)
+     * @return true if the path was marked
+     */
+    bool IsModernTexture(std::string_view path);
+
     // --- registry introspection ---
 
     /**
