@@ -25,9 +25,13 @@
 #include <dcomp.h>
 #include <d3dcompiler.h>
 
+#include <atomic>
+
 namespace
 {
     using wxl::gpu::Log;
+
+    std::atomic<bool> g_resetRequired{ false };
 
     // The engine backbuffer is X8R8G8B8 (DXGI B8G8R8X8_UNORM), which flip/composition swapchains reject, so
     // the swapchain is B8G8R8A8 and a shader blit bridges the two formats (a plain copy between the two
@@ -376,6 +380,16 @@ namespace
 
 namespace wxl::gpu::present
 {
+    bool ResetRequired()
+    {
+        return g_resetRequired.load(std::memory_order_relaxed);
+    }
+
+    void MarkRealReset()
+    {
+        g_resetRequired.store(false, std::memory_order_relaxed);
+    }
+
     bool PrepareForReset()
     {
         // A reset can arrive immediately after the last Present, before the next frame's normal fence wait.
@@ -418,7 +432,9 @@ namespace wxl::gpu::present
         // Minimized: nothing is visible and the composition swapchain retains its last frame, so
         // skip the whole blit/submit machinery instead of pushing frames into an occluded chain.
         // Returning true tells the capture hook the present is handled (native present stays off).
-        if (IsIconic(window)) return true;
+        // Latch the occlusion: the engine's post-restore Reset must then run natively (see
+        // ResetRequired) even though its params look unchanged.
+        if (IsIconic(window)) { g_resetRequired.store(true, std::memory_order_relaxed); return true; }
         if (trace)
         {
             RECT wr{}, cr{};
@@ -585,6 +601,7 @@ namespace wxl::gpu::present
         {
             // A persistently failing present (e.g. device removed) would otherwise log — and query
             // the driver — every frame; sample the first few then one in 600 like the capture miss log.
+            g_resetRequired.store(true, std::memory_order_relaxed); // recovery Reset must run natively
             static UINT submitFails = 0;
             ++submitFails;
             if (trace || submitFails <= 4 || (submitFails % 600) == 0)

@@ -45,4 +45,18 @@ namespace wxl::gpu::present
      * @return true when the frame was presented through our swapchain; false to fall back to the native present.
      */
     bool Present(IDirect3DDevice9* device, HWND window);
+
+    /**
+     * @brief True when a real native Reset must not be skipped.
+     *
+     * Set when the window was iconified or a present submit failed since the last real Reset: an
+     * engine Reset with UNCHANGED params right after either event is On12's recovery path, not a
+     * parasite — skipping it wedges the stack (observed DXGI_ERROR_DEVICE_HUNG, unrecoverable).
+     * TestCooperativeLevel cannot stand in for this signal: On12 reports D3D_OK throughout.
+     * @return true when the next Reset must run natively.
+     */
+    bool ResetRequired();
+
+    /** @brief Records that a real native Reset ran; clears the ResetRequired latch. */
+    void MarkRealReset();
 }

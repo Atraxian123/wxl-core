@@ -123,6 +123,7 @@ namespace
     {
         if (!NoopResetEnabled() || !g_appliedMode.valid) return false;
 
+        if (wxl::gpu::present::ResetRequired()) return false;
         if (dev->TestCooperativeLevel() != D3D_OK) return false;
         if (ID3D12Device* d12 = wxl::gpu::Device())
             if (FAILED(d12->GetDeviceRemovedReason())) return false;
@@ -365,8 +366,15 @@ namespace
         if (sanitized.hDeviceWindow) g_devWindow = sanitized.hDeviceWindow;
         const HRESULT hr = h->reset(dev, &sanitized);
         Log("capture: Reset end hr=0x%08lX", (unsigned long)hr);
-        if (SUCCEEDED(hr)) RememberAppliedMode(dev, sanitized, g_devWindow);
-        else               g_appliedMode.valid = false;
+        if (SUCCEEDED(hr))
+        {
+            RememberAppliedMode(dev, sanitized, g_devWindow);
+            wxl::gpu::present::MarkRealReset();
+        }
+        else
+        {
+            g_appliedMode.valid = false;
+        }
         return hr;
     }
 
