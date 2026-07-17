@@ -25,9 +25,11 @@
 
 #include <windows.h>
 #include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -35,6 +37,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace wxl::ipc;
@@ -170,17 +173,22 @@ namespace
     }
 
     /**
-     * @brief Picks the worker-thread count from the channel count: half, floored to at least one.
+     * @brief Picks the worker-thread count: channels - 1, overridable via WXL_HOST_WORKERS.
      *
      * Channels bound how many requests the client can have in flight; workers bound how many run at
-     * once. Using fewer workers than channels leaves headroom on the machine for the game client itself
-     * rather than pinning one CPU-bound thread to every logical core during a streaming burst.
+     * once. channels/2 halved throughput exactly when the client bursts (camera pans, tile entry):
+     * half the inflight opens queued behind the other half while the render thread waited on one of
+     * them. channels-1 keeps one logical core of headroom for the game client; most request time is
+     * I/O wait anyway, not CPU. WXL_HOST_WORKERS overrides for low-core machines or experiments.
      * @param channelCount  channel count chosen by wxl::host::ipc::Create()
-     * @return worker thread count, at least 1
+     * @return worker thread count, at least 1, at most channelCount
      */
     uint32_t ComputeWorkerCount(uint32_t channelCount)
     {
-        const uint32_t workers = channelCount / 2;
+        const uint64_t requested = EnvU64("WXL_HOST_WORKERS", 0, 0, 16);
+        if (requested)
+            return static_cast<uint32_t>(requested < channelCount ? requested : channelCount);
+        const uint32_t workers = channelCount ? channelCount - 1 : 1;
         return workers ? workers : 1;
     }
 
@@ -692,32 +700,23 @@ namespace
             return true;
         }
 
-        if (!ServeNativeArchives() && readName == requestName)
-        {
-            const uint64_t locateStarted = hprof::Now();
-            const wxl::host::mpq::Source source = g_mpq->Locate(readName);
-            trace.archiveTicks += hprof::Now() - locateStarted;
-            if (source == wxl::host::mpq::Source::None)
-            {
-                ++trace.archiveMisses;
-                return false;
-            }
-            if (source == wxl::host::mpq::Source::Standard)
-            {
-                ++trace.nativeSkips;
-                nativeHit = true;
-                return false;
-            }
-        }
-
+        // One fused walk: locate and read in the same pass, skipping the byte read entirely on a
+        // Standard-archive hit that the client will re-read natively anyway.
+        const bool skipStandard = !ServeNativeArchives() && readName == requestName;
         std::vector<uint8_t> raw;
         ++trace.archiveReads;
         const uint64_t archiveStarted = hprof::Now();
-        const bool archiveHit = g_mpq->ReadAll(readName, raw);
+        const wxl::host::mpq::Source source = g_mpq->LocateAndRead(readName, !skipStandard, raw);
         trace.archiveTicks += hprof::Now() - archiveStarted;
-        if (!archiveHit)
+        if (source == wxl::host::mpq::Source::None)
         {
             ++trace.archiveMisses;
+            return false;
+        }
+        if (skipStandard && source == wxl::host::mpq::Source::Standard)
+        {
+            ++trace.nativeSkips;
+            nativeHit = true;
             return false;
         }
 
@@ -739,11 +738,102 @@ namespace
         return true;
     }
 
+    // --- Neighbor-tile transform pre-warm ------------------------------------------------------
+    // Flying across a continent opens map tiles at a steady spatial rhythm, and a cold tile is the
+    // single most expensive host transform (the micro-freeze the player feels). When a tile is
+    // served, its eight neighbors are produced ahead of time on a below-normal-priority thread so
+    // the transform cache is already warm when the client reaches them.
+    std::mutex                      g_warmMutex;
+    std::condition_variable         g_warmCv;
+    std::deque<std::string>         g_warmQueue;
+    std::unordered_set<std::string> g_warmSeen;
+
+    /**
+     * @brief Splits a normalized "<prefix>_<x>_<y>.adt" tile key into its parts.
+     * @return false when the key is not a tile name.
+     */
+    bool ParseTileName(const std::string& key, std::string& prefixOut, int& xOut, int& yOut)
+    {
+        if (key.size() < 9 || key.compare(key.size() - 4, 4, ".adt") != 0) return false;
+        const size_t stemEnd = key.size() - 4;
+        const size_t yUnd = key.rfind('_', stemEnd - 1);
+        if (yUnd == std::string::npos || yUnd + 1 >= stemEnd) return false;
+        const size_t xUnd = yUnd ? key.rfind('_', yUnd - 1) : std::string::npos;
+        if (xUnd == std::string::npos || xUnd + 1 >= yUnd) return false;
+        int x = 0, y = 0;
+        for (size_t i = xUnd + 1; i < yUnd; ++i)
+        {
+            if (!std::isdigit(static_cast<unsigned char>(key[i]))) return false;
+            x = x * 10 + (key[i] - '0');
+        }
+        for (size_t i = yUnd + 1; i < stemEnd; ++i)
+        {
+            if (!std::isdigit(static_cast<unsigned char>(key[i]))) return false;
+            y = y * 10 + (key[i] - '0');
+        }
+        prefixOut = key.substr(0, xUnd);
+        xOut = x;
+        yOut = y;
+        return true;
+    }
+
+    /** @brief Queues the 3x3 neighborhood of a just-served tile for background pre-transform. */
+    void QueueNeighborTiles(const std::string& servedName)
+    {
+        std::string prefix;
+        int x = 0, y = 0;
+        if (!ParseTileName(NameKey(servedName), prefix, x, y)) return;
+        bool queued = false;
+        {
+            std::lock_guard<std::mutex> lk(g_warmMutex);
+            if (g_warmSeen.size() > 8192) g_warmSeen.clear(); // bounded memory; a re-warm is harmless
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx)
+                {
+                    if (!dx && !dy) continue;
+                    const int nx = x + dx, ny = y + dy;
+                    if (nx < 0 || nx > 63 || ny < 0 || ny > 63) continue;
+                    if (g_warmQueue.size() >= 64) continue; // a burst is already pending
+                    std::string n = prefix + '_' + std::to_string(nx) + '_' + std::to_string(ny) + ".adt";
+                    if (g_warmSeen.insert(n).second)
+                    {
+                        g_warmQueue.push_back(std::move(n));
+                        queued = true;
+                    }
+                }
+        }
+        if (queued) g_warmCv.notify_one();
+    }
+
+    /** @brief Below-normal-priority worker producing queued neighbor tiles into the transform cache. */
+    DWORD WINAPI TileWarmer(LPVOID)
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        for (;;)
+        {
+            std::string name;
+            {
+                std::unique_lock<std::mutex> lk(g_warmMutex);
+                g_warmCv.wait(lk, [] { return !g_warmQueue.empty(); });
+                name = std::move(g_warmQueue.front());
+                g_warmQueue.pop_front();
+            }
+            hprof::OpenTrace trace; // warm-path stats stay out of the live request profile
+            std::vector<uint8_t> bytes;
+            bool nativeHit = false;
+            ProduceCandidate(name, name, bytes, trace, nativeHit);
+        }
+        return 0;
+    }
+
     bool ProduceServed(const std::string& name, std::vector<uint8_t>& out, hprof::OpenTrace& trace)
     {
         bool nativeHit = false;
         if (ProduceCandidate(name, name, out, trace, nativeHit))
+        {
+            QueueNeighborTiles(name);
             return true;
+        }
 
         // A native hit means the client will read these exact bytes from its own archives; trying the
         // aliases here could serve a DIFFERENT file over a name the client resolves fine natively.
@@ -985,6 +1075,11 @@ namespace
         // time the first HD model needs an FDID the several-second cold table load is normally complete.
         if (HANDLE warmer = CreateThread(nullptr, 0, ResolverWarmer, nullptr, 0, nullptr))
             CloseHandle(warmer);
+
+        // Pre-produces the neighbors of each served map tile so flight streaming hits a warm
+        // transform cache instead of paying a cold tile transform inside a live open.
+        if (HANDLE tileWarmer = CreateThread(nullptr, 0, TileWarmer, nullptr, 0, nullptr))
+            CloseHandle(tileWarmer);
 
         if (!wxl::host::ipc::Create())
         {
