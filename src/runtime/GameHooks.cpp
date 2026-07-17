@@ -322,12 +322,12 @@ namespace
         return VirtualAlloc(g_m2ArenaBase + offset, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
     }
 
-    void FreeArenaRangeLocked(uint32_t offset, uint32_t size)
+    // Inserts a range back into the free list and coalesces neighbours. List surgery only — the
+    // caller decommits (outside the mutex) when the range's pages were actually committed.
+    void InsertArenaFreeRangeLocked(uint32_t offset, uint32_t size)
     {
         if (!g_m2ArenaBase || size == 0)
             return;
-
-        VirtualFree(g_m2ArenaBase + offset, size, MEM_DECOMMIT);
 
         M2ArenaRange r{ offset, size };
         auto it = g_m2ArenaFree.begin();
@@ -354,16 +354,24 @@ namespace
         }
     }
 
-    void* TryArenaM2AllocLocked(uint32_t size)
+    /**
+     * @brief Reserves a first-fit range from the arena free list. Caller holds the mutex.
+     *
+     * Only the free-list surgery happens here; the MEM_COMMIT (a kernel call that zero-fills
+     * megabytes) is the caller's job, outside the mutex, so concurrent loader threads and the
+     * main thread's force-wait path stop serializing behind each other's page commits.
+     * @param need       page-aligned byte count to reserve.
+     * @param offsetOut  receives the reserved arena offset.
+     * @return true when a range was reserved.
+     */
+    bool ReserveArenaRangeLocked(uint32_t need, uint32_t& offsetOut)
     {
         if (!EnsureM2ArenaLocked())
-            return nullptr;
+            return false;
 
-        const uint32_t need = AlignUpU32(size + 0x20u, 0x1000u);
         for (size_t i = 0; i < g_m2ArenaFree.size(); ++i)
         {
             const M2ArenaRange range = g_m2ArenaFree[i];
-            const uint32_t allocOffset = range.offset;
             if (range.size < need)
                 continue;
 
@@ -376,20 +384,10 @@ namespace
                 g_m2ArenaFree[i].offset = range.offset + need;
                 g_m2ArenaFree[i].size = range.size - need;
             }
-
-            if (!CommitArenaRange(range.offset, need))
-            {
-                FreeArenaRangeLocked(range.offset, need);
-                return nullptr;
-            }
-
-            auto* ptr = g_m2ArenaBase + allocOffset + 0x10u;
-            ptr[-1] = 0x10u;
-            g_virtualM2Allocs.emplace(ptr, VirtualM2Allocation{ nullptr, range.offset, need });
-            return ptr;
+            offsetOut = range.offset;
+            return true;
         }
-
-        return nullptr;
+        return false;
     }
 
     void* TryVirtualM2Alloc(uint32_t size)
@@ -431,11 +429,15 @@ namespace
                 ours = true;
             }
 
-            if (ours && !alloc.base)
-            {
-                FreeArenaRangeLocked(alloc.arenaOffset, alloc.arenaSize);
-                return;
-            }
+        }
+
+        if (ours && !alloc.base)
+        {
+            // Decommit outside the mutex (kernel call), then give the range back to the free list.
+            VirtualFree(g_m2ArenaBase + alloc.arenaOffset, alloc.arenaSize, MEM_DECOMMIT);
+            std::lock_guard<std::mutex> lock(g_virtualM2AllocMutex);
+            InsertArenaFreeRangeLocked(alloc.arenaOffset, alloc.arenaSize);
+            return;
         }
 
         if (ours && alloc.base)
@@ -451,16 +453,31 @@ namespace
     {
         if (size >= VirtualM2AllocThreshold() && LargeM2VirtualAllocEnabled())
         {
-            void* ptr = nullptr;
+            const uint32_t need = AlignUpU32(size + 0x20u, 0x1000u);
+            uint32_t offset = 0;
+            bool reserved = false;
             {
                 std::lock_guard<std::mutex> lock(g_virtualM2AllocMutex);
-                ptr = TryArenaM2AllocLocked(size);
+                reserved = ReserveArenaRangeLocked(need, offset);
             }
-            if (ptr)
+            if (reserved)
             {
-                WLOG_INFO("m2-memory: arena buffer %u bytes (%s)", size, tag ? tag : "M2");
-                if (size >= 8u * 1024u * 1024u) LogClientAddressSpace("m2-arena");
-                return ptr;
+                // Commit outside the mutex; VirtualAlloc either commits the whole range or fails
+                // without committing, so a failure just returns the reserved range to the list.
+                if (CommitArenaRange(offset, need))
+                {
+                    auto* ptr = g_m2ArenaBase + offset + 0x10u;
+                    ptr[-1] = 0x10u;
+                    {
+                        std::lock_guard<std::mutex> lock(g_virtualM2AllocMutex);
+                        g_virtualM2Allocs.emplace(ptr, VirtualM2Allocation{ nullptr, offset, need });
+                    }
+                    WLOG_INFO("m2-memory: arena buffer %u bytes (%s)", size, tag ? tag : "M2");
+                    if (size >= 8u * 1024u * 1024u) LogClientAddressSpace("m2-arena");
+                    return ptr;
+                }
+                std::lock_guard<std::mutex> lock(g_virtualM2AllocMutex);
+                InsertArenaFreeRangeLocked(offset, need);
             }
 
             if (void* standalone = TryVirtualM2Alloc(size))
