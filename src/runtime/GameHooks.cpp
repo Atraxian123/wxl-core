@@ -71,7 +71,6 @@ namespace
     m2::M2_SortOpaqueGeoBatchesFn g_origSortOpaqueGeoBatches = nullptr;
     m2::M2_SlotDispatchFn      g_origSlotDispatch  = nullptr;
     m2::M2_SlotClearFn         g_origSlotClear     = nullptr;
-    void(__cdecl* g_origUnitFieldSetWrite)()       = nullptr;
     m2::M2_PerFrameUpdateFn    g_origM2PerFrame    = nullptr;
     m2::M2_BuildBonePaletteFn  g_origBuildBonePalette = nullptr;
     m2::M2_RenderBatchShadowMapFn g_origRenderBatchShadowMap = nullptr;
@@ -92,6 +91,7 @@ namespace
     unit::ObjectMsgHandlerFn   g_origObjUpdate    = nullptr;
     unit::ObjectMsgHandlerFn   g_origObjDestroy   = nullptr;
     unit::TargetSetFn          g_origTargetSet    = nullptr;
+    unit::UnitFieldSetWriteFn  g_origUnitFieldSetWrite = nullptr;
     snd::PlaySoundFn           g_origPlaySound    = nullptr;
     snd::PlaySoundKitFn        g_origPlaySoundKit = nullptr;
     std::atomic<uint32_t>      g_sceneHitTestFaults{ 0 };

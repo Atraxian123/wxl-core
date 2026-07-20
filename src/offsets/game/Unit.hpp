@@ -67,6 +67,10 @@ namespace wxl::offsets::game::unit
     // bytes -- this pattern should not be copied to hook other mid-function instructions without the
     // same check. Hooked via a naked/raw-register stub, not the typed Install<Fn> path (see GameHooks.cpp).
     constexpr uintptr_t kUnitFieldSetWrite = 0x00743BAC;
+    // Raw instruction hook, not a real function boundary -- see the comment above. __cdecl() with no
+    // params/return: the naked hook stub reads eax/ecx/edx manually rather than through the calling
+    // convention, so this alias exists purely to type g_origUnitFieldSetWrite for the jmp thunk.
+    using UnitFieldSetWriteFn = void(__cdecl*)();
 
     // Update-field indices for the three weapon-category visible-item entry fields (WotLK 3.3.5a client,
     // build matching this offsets table). Verified empirically: each fires with ecx == the newly equipped
