@@ -115,6 +115,9 @@ namespace wxl::events
     {
         void*    device;
         void*    model;
+        void*    section; // DrawBatchContext->section for this draw (wxl::structure::m2::M2SkinSection*),
+                           // or null if the context wasn't available. A COPY the native code owns --
+                           // valid only for the duration of this callback, do not retain the pointer.
         int      primType;
         int      baseVertex;
         uint32_t minIndex;
