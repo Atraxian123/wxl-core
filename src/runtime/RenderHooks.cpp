@@ -192,7 +192,10 @@ namespace
         if (g_curModel && !g_inM2Emit && ev::Any(ev::Event::OnM2BatchDraw))
         {
             g_inM2Emit = true;
-            ev::M2BatchDrawArgs a{ dev, g_curModel, pt, bv, mi, nv, drawStartIndex, pc };
+            void* section = g_curDrawCtx
+                ? static_cast<off::DrawBatchContext*>(g_curDrawCtx)->section
+                : nullptr;
+            ev::M2BatchDrawArgs a{ dev, g_curModel, section, pt, bv, mi, nv, drawStartIndex, pc };
             ev::Emit(ev::Event::OnM2BatchDraw, &a);
             g_inM2Emit = false;
         }
