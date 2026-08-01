@@ -244,14 +244,18 @@ namespace wxl::events
      *        row while building/rebuilding a creature's visible model (see
      *        db2::creaturemodeldata::kResolveMerge in offsets/game/DB2.hpp) -- covers every way a
      *        creature's model gets resolved, confirmed to be the single, centralized choke point via
-     *        "find references" (one call site client-wide). modelId is the row's own id
-     *        (creaturemodeldata::kOffId); record points at the resolved row (null if the lookup
+     *        "find references" (one call site client-wide). displayId is captured one step earlier,
+     *        at creaturedisplayinfo::kCaptureDisplayId, and carried forward -- it is the key you want
+     *        for a sidecar override table, NOT modelId: several CreatureDisplayInfo rows (different
+     *        texture-variant recolors of one creature) commonly share a single ModelId, so a
+     *        modelId-keyed override can't tell them apart, while displayId can. modelId and record
+     *        both still come from the CreatureModelData row itself (null record if the ModelId lookup
      *        failed -- subscribers should check before touching it). A subscriber may overwrite
      *        record's ModelName field (creaturemodeldata::kOffModelName) in place with a virtual
      *        path before the caller reads it, the same way ItemDisplayLookupArgs subscribers
      *        substitute Model1/Model2.
      */
-    struct CreatureModelResolveArgs { uint32_t modelId; void* record; };
+    struct CreatureModelResolveArgs { uint32_t displayId; uint32_t modelId; void* record; };
     /** @brief Args for OnM2PerFrameUpdate; renderCtx is the per-instance render context that the
      *         scene graph is updating — fires once per visible M2 instance per frame. */
     struct M2PerFrameUpdateArgs { void* renderCtx; };

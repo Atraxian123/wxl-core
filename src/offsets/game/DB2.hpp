@@ -136,6 +136,23 @@ namespace wxl::offsets::game::db2
         constexpr size_t kOffTextureVariation1 = 0x18; // char*
         constexpr size_t kOffTextureVariation2 = 0x1C; // char*
         constexpr size_t kOffTextureVariation3 = 0x20; // char*
+
+        // kCaptureDisplayId is NOT a function boundary -- it is the raw instruction address reached
+        // immediately after the inline CreatureDisplayInfo lookup succeeds, inside
+        // creaturemodeldata::kResolveFn (single predecessor: only the `jne` guarding the lookup's
+        // success path reaches this exact address, so nothing branches into the middle of the
+        // overwritten bytes). ESI at this address holds the displayId that was just resolved -- the
+        // ONLY point in kResolveFn where displayId is still live, since it goes out of scope
+        // afterward in favor of ModelId. This exists purely to carry displayId forward to
+        // creaturemodeldata::kResolveMerge, which fires later in the SAME call and needs it to key a
+        // per-displayId model-path override rather than a per-ModelId one (several displayIds
+        // commonly share one ModelId, e.g. texture-variant recolors of one creature, so a
+        // ModelId-keyed override can't tell them apart -- see OnCreatureModelResolve's doc comment
+        // in Event.hpp). Relies on kResolveFn executing synchronously, single-threaded, start to
+        // finish with no reentrancy between this hook and kResolveMerge -- true given the confirmed
+        // single call site, but worth remembering if that calling pattern is ever revisited.
+        constexpr uintptr_t kCaptureDisplayId = 0x0072A4F3;
+        using CaptureDisplayIdFn = void(__cdecl*)();
     }
 
     // -------------------------------------------------------------------------

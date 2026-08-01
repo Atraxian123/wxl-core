@@ -98,6 +98,7 @@ namespace
     snd::PlaySoundFn           g_origPlaySound    = nullptr;
     snd::PlaySoundKitFn        g_origPlaySoundKit = nullptr;
     db2::itemdisplayinfo::LookupFn g_origItemDisplayLookup = nullptr;
+    db2::creaturedisplayinfo::CaptureDisplayIdFn g_origCreatureCaptureDisplayId = nullptr;
     db2::creaturemodeldata::ResolveMergeFn g_origCreatureModelResolveMerge = nullptr;
     std::atomic<uint32_t>      g_sceneHitTestFaults{ 0 };
     std::atomic<uint32_t>      g_textureUpdateFaults{ 0 };
@@ -1397,19 +1398,69 @@ namespace
         return ok;
     }
 
+    // Scratch: displayId captured at creaturedisplayinfo::kCaptureDisplayId, consumed by
+    // hkCreatureModelResolveMerge later in the SAME call to creaturemodeldata::kResolveFn. Safe only
+    // because kResolveFn runs synchronously, single-threaded, start to finish, with nothing able to
+    // interleave between the two hook points -- see kCaptureDisplayId's doc comment in DB2.hpp. Not
+    // meaningful outside the window between the two hooks firing; treat as write-then-immediately-
+    // consume, not a general-purpose "current displayId" global.
+    uint32_t g_pendingCreatureDisplayId = 0;
+
+    /**
+     * @brief C++ side of the displayId-capture hook, called from the naked stub below.
+     *
+     * Stashes the displayId that was just resolved (ESI at kCaptureDisplayId) into
+     * g_pendingCreatureDisplayId, for hkCreatureModelResolveMerge to pick up later in the same call.
+     * See kCaptureDisplayId's doc comment in DB2.hpp for why this exists -- displayId goes out of
+     * scope inside kResolveFn after this point, in favor of ModelId, so it has to be carried forward
+     * explicitly rather than re-read later.
+     * @param displayId  ESI at kCaptureDisplayId: the displayId just resolved via CreatureDisplayInfo.
+     */
+    void __cdecl OnCreatureCaptureDisplayIdCaptured(uint32_t displayId)
+    {
+        g_pendingCreatureDisplayId = displayId;
+    }
+
+    /**
+     * @brief Detours db2::creaturedisplayinfo::kCaptureDisplayId directly (not a function boundary).
+     *
+     * Captures ESI exactly as it stands at that address, forwards it to
+     * OnCreatureCaptureDisplayIdCaptured() as a plain cdecl argument, then restores every register
+     * and flag and jumps into the trampoline -- same shape as hkUnitFieldSetWrite/2 and
+     * hkCreatureModelResolveMerge below.
+     */
+    __declspec(naked) void hkCreatureCaptureDisplayId()
+    {
+        __asm
+        {
+            pushfd
+            pushad
+            push esi           ; displayId (1st and only cdecl arg)
+            call OnCreatureCaptureDisplayIdCaptured
+            add esp, 4
+            popad
+            popfd
+            jmp g_origCreatureCaptureDisplayId
+        }
+    }
+
     /**
      * @brief C++ side of the creature-model resolve-merge capture, called from the naked stub below.
      *
      * record is the CreatureModelData row EAX held at db2::creaturemodeldata::kResolveMerge, or null
-     * if the inline lookup failed (out-of-range ModelId). Emits OnCreatureModelResolve so a
+     * if the inline lookup failed (out-of-range ModelId). Pairs record with whatever
+     * g_pendingCreatureDisplayId currently holds (set moments earlier by
+     * OnCreatureCaptureDisplayIdCaptured in this same call) and emits OnCreatureModelResolve so a
      * subscriber can substitute ModelName in place before the caller (still inside kResolveFn) reads
-     * it -- same pattern as OnItemDisplayLookup, see that event's doc comment in Event.hpp.
+     * it -- same pattern as OnItemDisplayLookup, see that event's doc comment in Event.hpp. displayId,
+     * not modelId, is the key a sidecar override table should use -- see CreatureModelResolveArgs's
+     * doc comment in Event.hpp for why.
      * @param record  EAX at kResolveMerge: the resolved CreatureModelData row pointer, or null.
      */
     void __cdecl OnCreatureModelResolveMergeCaptured(void* record)
     {
         if (!record) return;
-        ev::CreatureModelResolveArgs a{ *static_cast<uint32_t*>(record), record };
+        ev::CreatureModelResolveArgs a{ g_pendingCreatureDisplayId, *static_cast<uint32_t*>(record), record };
         ev::Emit(ev::Event::OnCreatureModelResolve, &a);
     }
 
@@ -1764,6 +1815,11 @@ namespace wxl::runtime::game
         wxl::core::hook::Install("ItemDisplayInfoLookup", db2::itemdisplayinfo::kLookup,
                                  reinterpret_cast<void*>(&hkItemDisplayLookup),
                                  reinterpret_cast<void**>(&g_origItemDisplayLookup));
+        // Raw instruction hook, not a function boundary -- see kCaptureDisplayId's doc comment in
+        // DB2.hpp. Must be installed alongside CreatureModelResolveMerge below; the two work as a pair.
+        wxl::core::hook::Install("CreatureCaptureDisplayId", db2::creaturedisplayinfo::kCaptureDisplayId,
+                                 reinterpret_cast<void*>(&hkCreatureCaptureDisplayId),
+                                 reinterpret_cast<void**>(&g_origCreatureCaptureDisplayId));
         // Raw instruction hook, not a function boundary -- see kResolveMerge's doc comment in
         // DB2.hpp. Confirmed single call site (creaturemodeldata::kResolveFn has exactly one caller
         // client-wide), so this covers every way a creature's model gets resolved.
@@ -1800,7 +1856,7 @@ namespace wxl::runtime::game
             wxl::core::mem::Patch(reinterpret_cast<void*>(adt::kLiquidRowFlagTest), guard, sizeof guard);
         }
 
-        WLOG_INFO("game: hooks installed (M2BufferAlloc, M2BufferFree, M2Init, M2FinalizeSkin, M2SetupBatchAlpha, M2SortOpaqueGeoBatches, M2RenderBatchShadowMap, DoodadSpawn, TextureUpdate, TextureCreate, ChunkBuild, WmoRootComplete, WmoGroupParse, CWorldEnter, FramePump, ObjectUpdate, ObjectDestroy, TargetSet, PlaySound, PlaySoundKit, CharModelSlotDispatch, CharModelSlotClear, M2PerFrameUpdate, M2BuildBonePalette, ItemDisplayInfoLookup, UnitFieldSetWrite2, CreatureModelResolveMerge)");
+        WLOG_INFO("game: hooks installed (M2BufferAlloc, M2BufferFree, M2Init, M2FinalizeSkin, M2SetupBatchAlpha, M2SortOpaqueGeoBatches, M2RenderBatchShadowMap, DoodadSpawn, TextureUpdate, TextureCreate, ChunkBuild, WmoRootComplete, WmoGroupParse, CWorldEnter, FramePump, ObjectUpdate, ObjectDestroy, TargetSet, PlaySound, PlaySoundKit, CharModelSlotDispatch, CharModelSlotClear, M2PerFrameUpdate, M2BuildBonePalette, ItemDisplayInfoLookup, UnitFieldSetWrite2, CreatureCaptureDisplayId, CreatureModelResolveMerge)");
     }
 
     uint32_t ItemDisplayInfoLookupNative(uint32_t displayId, void* outBuf)
