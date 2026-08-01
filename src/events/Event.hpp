@@ -63,6 +63,8 @@ namespace wxl::events
                               // (ItemDisplayLookupArgs)
         OnCreatureDisplayChange, // UNIT_FIELD_DISPLAYID was committed for some object
                               // (CreatureDisplayChangeArgs)
+        OnCreatureModelResolve, // a CreatureModelData row was resolved while rebuilding a creature's
+                              // visible model (CreatureModelResolveArgs)
         OnWorldEnter,    // the world/map finished loading, in-world   (WorldEnterArgs)
         OnWorldLeave,    // the world/map is being torn down           (WorldLeaveArgs)
         OnBeforeHostLaunch, // the DLL is about to launch the asset host (HostLaunchArgs)
@@ -237,6 +239,19 @@ namespace wxl::events
      *        should ignore native==true events.
      */
     struct CreatureDisplayChangeArgs { void* unit; uint32_t displayId; bool native; };
+    /**
+     * @brief Args for OnCreatureModelResolve; fires whenever the client resolves a CreatureModelData
+     *        row while building/rebuilding a creature's visible model (see
+     *        db2::creaturemodeldata::kResolveMerge in offsets/game/DB2.hpp) -- covers every way a
+     *        creature's model gets resolved, confirmed to be the single, centralized choke point via
+     *        "find references" (one call site client-wide). modelId is the row's own id
+     *        (creaturemodeldata::kOffId); record points at the resolved row (null if the lookup
+     *        failed -- subscribers should check before touching it). A subscriber may overwrite
+     *        record's ModelName field (creaturemodeldata::kOffModelName) in place with a virtual
+     *        path before the caller reads it, the same way ItemDisplayLookupArgs subscribers
+     *        substitute Model1/Model2.
+     */
+    struct CreatureModelResolveArgs { uint32_t modelId; void* record; };
     /** @brief Args for OnM2PerFrameUpdate; renderCtx is the per-instance render context that the
      *         scene graph is updating — fires once per visible M2 instance per frame. */
     struct M2PerFrameUpdateArgs { void* renderCtx; };
