@@ -93,7 +93,8 @@ namespace
     unit::ObjectMsgHandlerFn   g_origObjUpdate    = nullptr;
     unit::ObjectMsgHandlerFn   g_origObjDestroy   = nullptr;
     unit::TargetSetFn          g_origTargetSet    = nullptr;
-    unit::UnitFieldSetWriteFn  g_origUnitFieldSetWrite = nullptr;
+    unit::UnitFieldSetWriteFn  g_origUnitFieldSetWrite  = nullptr;
+    unit::UnitFieldSetWrite2Fn g_origUnitFieldSetWrite2 = nullptr;
     snd::PlaySoundFn           g_origPlaySound    = nullptr;
     snd::PlaySoundKitFn        g_origPlaySoundKit = nullptr;
     db2::itemdisplayinfo::LookupFn g_origItemDisplayLookup = nullptr;
@@ -1397,7 +1398,7 @@ namespace
 
     /**
      * @brief Maps a raw update-field index to a weapon slot (0=mainhand, 1=offhand, 2=ranged).
-     * @param fieldIndex  the edx value seen at kUnitFieldSetWrite.
+     * @param fieldIndex  the edx value seen at kUnitFieldSetWrite (or kUnitFieldSetWrite2).
      * @param slotOut     receives the mapped slot on a match.
      * @return false if fieldIndex isn't one of the three weapon-visual entry fields.
      */
@@ -1413,17 +1414,29 @@ namespace
     }
 
     /**
-     * @brief C++ side of the update-field write capture, called from the naked register-capture stub.
+     * @brief C++ side of the update-field write capture, called from both naked register-capture
+     *        stubs (kUnitFieldSetWrite and kUnitFieldSetWrite2 -- two separate ICF-folded copies
+     *        of the same commit instruction, see the doc comment on kUnitFieldSetWrite2 in
+     *        Unit.hpp; this handler doesn't need to know which site fired, both hand it the same
+     *        eax/edx/ecx triple).
      *
      * Fires on EVERY field write for EVERY object (health, mana, auras, everything) -- the early
-     * ResolveWeaponVisualSlot() bail keeps this cheap for the overwhelming majority of calls that
-     * aren't weapon-visual fields.
+     * bail-outs below keep this cheap for the overwhelming majority of calls that aren't one of
+     * the handful of fields anything subscribes to.
      * @param fieldArrayBase  eax at the write instruction: the object's field array base.
      * @param fieldIndex      edx at the write instruction: which field.
      * @param value           ecx at the write instruction: the new value being committed.
      */
     void __cdecl OnUnitFieldSetCaptured(uint32_t fieldArrayBase, uint32_t fieldIndex, uint32_t value)
     {
+        if (fieldIndex == unit::kFieldUnitDisplayId || fieldIndex == unit::kFieldUnitNativeDisplayId)
+        {
+            void* unitPtr = reinterpret_cast<uint8_t*>(fieldArrayBase) - unit::kUnitFieldArrayOffset;
+            ev::CreatureDisplayChangeArgs a{ unitPtr, value, fieldIndex == unit::kFieldUnitNativeDisplayId };
+            ev::Emit(ev::Event::OnCreatureDisplayChange, &a);
+            return;
+        }
+
         uint32_t slot;
         if (!ResolveWeaponVisualSlot(fieldIndex, slot))
             return;
@@ -1459,6 +1472,29 @@ namespace
             popad
             popfd
             jmp g_origUnitFieldSetWrite
+        }
+    }
+
+    /**
+     * @brief Second, independent detour on kUnitFieldSetWrite2 -- see its doc comment in Unit.hpp.
+     *
+     * Identical shape to hkUnitFieldSetWrite, own trampoline, same shared C++ handler. A creature
+     * displayId write from `.creature transform` was traced through THIS site, not the other one.
+     */
+    __declspec(naked) void hkUnitFieldSetWrite2()
+    {
+        __asm
+        {
+            pushfd
+            pushad
+            push ecx
+            push edx
+            push eax
+            call OnUnitFieldSetCaptured
+            add esp, 12
+            popad
+            popfd
+            jmp g_origUnitFieldSetWrite2
         }
     }
 
@@ -1694,6 +1730,11 @@ namespace wxl::runtime::game
         wxl::core::hook::Install("UnitFieldSetWrite", unit::kUnitFieldSetWrite,
                                  reinterpret_cast<void*>(&hkUnitFieldSetWrite),
                                  reinterpret_cast<void**>(&g_origUnitFieldSetWrite));
+        // Second, independent ICF-folded copy of the same instruction -- see kUnitFieldSetWrite2's
+        // doc comment in Unit.hpp. Installed the same way, own trampoline.
+        wxl::core::hook::Install("UnitFieldSetWrite2", unit::kUnitFieldSetWrite2,
+                                 reinterpret_cast<void*>(&hkUnitFieldSetWrite2),
+                                 reinterpret_cast<void**>(&g_origUnitFieldSetWrite2));
         wxl::core::hook::Install("M2PerFrameUpdate", m2::kM2PerFrameUpdate,
                                  reinterpret_cast<void*>(&hkM2PerFrameUpdate),
                                  reinterpret_cast<void**>(&g_origM2PerFrame));
@@ -1712,7 +1753,7 @@ namespace wxl::runtime::game
             wxl::core::mem::Patch(reinterpret_cast<void*>(adt::kLiquidRowFlagTest), guard, sizeof guard);
         }
 
-        WLOG_INFO("game: hooks installed (M2BufferAlloc, M2BufferFree, M2Init, M2FinalizeSkin, M2SetupBatchAlpha, M2SortOpaqueGeoBatches, M2RenderBatchShadowMap, DoodadSpawn, TextureUpdate, TextureCreate, ChunkBuild, WmoRootComplete, WmoGroupParse, CWorldEnter, FramePump, ObjectUpdate, ObjectDestroy, TargetSet, PlaySound, PlaySoundKit, CharModelSlotDispatch, CharModelSlotClear, M2PerFrameUpdate, M2BuildBonePalette, ItemDisplayInfoLookup)");
+        WLOG_INFO("game: hooks installed (M2BufferAlloc, M2BufferFree, M2Init, M2FinalizeSkin, M2SetupBatchAlpha, M2SortOpaqueGeoBatches, M2RenderBatchShadowMap, DoodadSpawn, TextureUpdate, TextureCreate, ChunkBuild, WmoRootComplete, WmoGroupParse, CWorldEnter, FramePump, ObjectUpdate, ObjectDestroy, TargetSet, PlaySound, PlaySoundKit, CharModelSlotDispatch, CharModelSlotClear, M2PerFrameUpdate, M2BuildBonePalette, ItemDisplayInfoLookup, UnitFieldSetWrite2)");
     }
 
     uint32_t ItemDisplayInfoLookupNative(uint32_t displayId, void* outBuf)
