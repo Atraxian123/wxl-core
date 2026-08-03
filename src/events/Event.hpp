@@ -248,12 +248,20 @@ namespace wxl::events
      *        at creaturedisplayinfo::kCaptureDisplayId, and carried forward -- it is the key you want
      *        for a sidecar override table, NOT modelId: several CreatureDisplayInfo rows (different
      *        texture-variant recolors of one creature) commonly share a single ModelId, so a
-     *        modelId-keyed override can't tell them apart, while displayId can. modelId and record
-     *        both still come from the CreatureModelData row itself (null record if the ModelId lookup
-     *        failed -- subscribers should check before touching it). A subscriber may overwrite
-     *        record's ModelName field (creaturemodeldata::kOffModelName) in place with a virtual
-     *        path before the caller reads it, the same way ItemDisplayLookupArgs subscribers
-     *        substitute Model1/Model2.
+     *        modelId-keyed override can't tell them apart, while displayId can. modelId comes from the
+     *        CreatureModelData row itself (0 if the ModelId lookup failed -- subscribers should check
+     *        record before touching it).
+     *
+     *        IMPORTANT: unlike ItemDisplayLookupArgs::record (a caller-owned stack copy -- see
+     *        ItemDisplayInfo::kLookup's doc comment in DB2.hpp), record here is NEVER the live,
+     *        shared db2::creaturemodeldata::kIdTable row -- it is a private scratch copy the emitter
+     *        (GameHooks.cpp's OnCreatureModelResolveMergeCaptured) makes specifically so subscribers
+     *        have somewhere safe to write. A subscriber may freely overwrite record's ModelName field
+     *        (creaturemodeldata::kOffModelName) in place with a virtual path; the emitter detects the
+     *        change and redirects the resolve to it without ever touching the real table row.
+     *        Writing ModelName on the real row used to be the documented pattern here and was a bug:
+     *        several displayIds sharing one ModelId would permanently corrupt each other's ModelName
+     *        for the rest of the process, since the "live" row is shared and persistent, not per-call.
      */
     struct CreatureModelResolveArgs { uint32_t displayId; uint32_t modelId; void* record; };
     /** @brief Args for OnM2PerFrameUpdate; renderCtx is the per-instance render context that the

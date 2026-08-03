@@ -72,28 +72,8 @@ namespace wxl::offsets::game::unit
     // convention, so this alias exists purely to type g_origUnitFieldSetWrite for the jmp thunk.
     using UnitFieldSetWriteFn = void(__cdecl*)();
 
-    // Second, separate ICF fold of the exact same `mov dword ptr [eax+edx*4], ecx` field-commit
-    // instruction as kUnitFieldSetWrite -- found via live read/write tracing on a creature's
-    // UNIT_FIELD_DISPLAYID slot while running `.creature transform`, which writes through THIS site,
-    // not kUnitFieldSetWrite. The linker evidently didn't fold every call site into one physical
-    // copy; whichever call sites the compiler emitted from a different translation unit/inlining
-    // context landed on this second copy instead. Same shape, same safety justification (sits
-    // directly before its own `pop ebp; ret 8` epilogue), same eax/edx/ecx convention -- hooked the
-    // same way, as an independent naked stub with its own trampoline, NOT routed through
-    // kUnitFieldSetWrite's hook. Whether any *other* field types besides displayId also route through
-    // this copy instead of the first is unconfirmed; treat both sites as covering an unknown, possibly
-    // overlapping subset of fields until proven otherwise.
-    //
-    // Address confirmed against wow.exe's default 0x00400000 base (verified in the Memory Map, base
-    // column reads 00400000, not relocated) -- an earlier capture in a session where the module had
-    // loaded at a different base read this same instruction (same low 3 hex digits, 0AA0) at
-    // 0x01260AA0; that value was wrong and must not be used. If this address ever again turns up
-    // wrong, re-check the module's actual base before assuming the instruction moved.
-    constexpr uintptr_t kUnitFieldSetWrite2 = 0x014E0AA0;
-    using UnitFieldSetWrite2Fn = void(__cdecl*)();
-
     // UNIT_FIELD_DISPLAYID's real update-field index. Confirmed directly (not inferred): captured
-    // at kUnitFieldSetWrite2 during `.creature transform 33110` with edx=0x43 and ecx=0x8156
+    // during `.creature transform 33110` with edx=0x43 and ecx=0x8156
     // (33110 decimal) landing in the same instruction hit -- ecx matching the exact displayId set
     // is conclusive, not coincidental.
     constexpr uint32_t kFieldUnitDisplayId = 0x43;
