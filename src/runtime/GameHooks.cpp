@@ -93,10 +93,12 @@ namespace
     unit::ObjectMsgHandlerFn   g_origObjUpdate    = nullptr;
     unit::ObjectMsgHandlerFn   g_origObjDestroy   = nullptr;
     unit::TargetSetFn          g_origTargetSet    = nullptr;
-    unit::UnitFieldSetWriteFn  g_origUnitFieldSetWrite = nullptr;
+    unit::UnitFieldSetWriteFn  g_origUnitFieldSetWrite  = nullptr;
     snd::PlaySoundFn           g_origPlaySound    = nullptr;
     snd::PlaySoundKitFn        g_origPlaySoundKit = nullptr;
     db2::itemdisplayinfo::LookupFn g_origItemDisplayLookup = nullptr;
+    db2::creaturedisplayinfo::CaptureDisplayIdFn g_origCreatureCaptureDisplayId = nullptr;
+    db2::creaturemodeldata::ResolveMergeFn g_origCreatureModelResolveMerge = nullptr;
     std::atomic<uint32_t>      g_sceneHitTestFaults{ 0 };
     std::atomic<uint32_t>      g_textureUpdateFaults{ 0 };
     std::atomic<uint32_t>      g_opaqueSortFaults{ 0 };
@@ -1396,6 +1398,153 @@ namespace
     }
 
     /**
+     * @brief Private substitute for the live db2::creaturemodeldata::kIdTable row, used ONLY to hand
+     *        OnCreatureModelResolve subscribers something safe to write into.
+     *
+     * BUG THIS FIXES: EAX at kResolveMerge points directly into the persistent, shared
+     * CreatureModelData table row for a ModelId -- NOT a caller-owned copy the way
+     * ItemDisplayInfo::kLookup's outBuf is (see that function's doc comment in DB2.hpp: it explicitly
+     * fills a caller-supplied buffer with a record COPY). Several displayIds commonly share one
+     * ModelId (see creaturemodeldata's own doc comment), so a subscriber that wrote ModelName in
+     * place on the real row -- which is what this used to do -- permanently corrupted that ModelId's
+     * entry for every displayId and every future resolve that shares it, for the rest of the process:
+     * whichever displayId resolved last "won" for all of them, including displayIds with no sidecar
+     * entry of their own. Confirmed against a real repro: two displayIds sharing one ModelId
+     * (manawyrm2mount, ModelId 7252) baking to two different virtual paths, where the second resolve
+     * silently inherited the first's already-mutated (and no-longer-real) ModelName.
+     *
+     * Only mirrors the two fields anything downstream of kResolveMerge is documented to touch: id at
+     * +0 and ModelName at +kOffModelName (see CreatureModelResolveArgs's doc comment in Event.hpp --
+     * "before the caller ... reads it" was always describing exactly one field). If some other field
+     * at a higher offset ever turns out to matter to kResolveFn's continuation after this point, this
+     * buffer needs to grow to cover it -- unconfirmed either way, since the real record's full struct
+     * size/layout was never RE'd.
+     *
+     * Single static instance is safe under the same guarantee kCaptureDisplayId's doc comment already
+     * relies on: kResolveFn runs synchronously, single-threaded, start to finish, with nothing able to
+     * interleave between hook points in the same call.
+     */
+    alignas(4) uint8_t g_creatureModelScratch[db2::creaturemodeldata::kOffModelName + sizeof(void*)] = {};
+
+    // Scratch: displayId captured at creaturedisplayinfo::kCaptureDisplayId, consumed by
+    // hkCreatureModelResolveMerge later in the SAME call to creaturemodeldata::kResolveFn. Safe only
+    // because kResolveFn runs synchronously, single-threaded, start to finish, with nothing able to
+    // interleave between the two hook points -- see kCaptureDisplayId's doc comment in DB2.hpp. Not
+    // meaningful outside the window between the two hooks firing; treat as write-then-immediately-
+    // consume, not a general-purpose "current displayId" global.
+    uint32_t g_pendingCreatureDisplayId = 0;
+
+    /**
+     * @brief C++ side of the displayId-capture hook, called from the naked stub below.
+     *
+     * Stashes the displayId that was just resolved (ESI at kCaptureDisplayId) into
+     * g_pendingCreatureDisplayId, for hkCreatureModelResolveMerge to pick up later in the same call.
+     * See kCaptureDisplayId's doc comment in DB2.hpp for why this exists -- displayId goes out of
+     * scope inside kResolveFn after this point, in favor of ModelId, so it has to be carried forward
+     * explicitly rather than re-read later.
+     * @param displayId  ESI at kCaptureDisplayId: the displayId just resolved via CreatureDisplayInfo.
+     */
+    void __cdecl OnCreatureCaptureDisplayIdCaptured(uint32_t displayId)
+    {
+        g_pendingCreatureDisplayId = displayId;
+    }
+
+    /**
+     * @brief Detours db2::creaturedisplayinfo::kCaptureDisplayId directly (not a function boundary).
+     *
+     * Captures ESI exactly as it stands at that address, forwards it to
+     * OnCreatureCaptureDisplayIdCaptured() as a plain cdecl argument, then restores every register
+     * and flag and jumps into the trampoline -- same shape as hkUnitFieldSetWrite and
+     * hkCreatureModelResolveMerge below.
+     */
+    __declspec(naked) void hkCreatureCaptureDisplayId()
+    {
+        __asm
+        {
+            pushfd
+            pushad
+            push esi           ; displayId (1st and only cdecl arg)
+            call OnCreatureCaptureDisplayIdCaptured
+            add esp, 4
+            popad
+            popfd
+            jmp g_origCreatureCaptureDisplayId
+        }
+    }
+
+    /**
+     * @brief C++ side of the creature-model resolve-merge capture, called from the naked stub below.
+     *
+     * record is the CreatureModelData row EAX held at db2::creaturemodeldata::kResolveMerge, or null
+     * if the inline lookup failed (out-of-range ModelId). Pairs record's id with whatever
+     * g_pendingCreatureDisplayId currently holds (set moments earlier by
+     * OnCreatureCaptureDisplayIdCaptured in this same call), copies the two fields a subscriber can
+     * touch into g_creatureModelScratch, and emits OnCreatureModelResolve with THAT scratch copy --
+     * never the live row -- so a subscriber can freely overwrite ModelName without corrupting every
+     * other displayId sharing this ModelId. See g_creatureModelScratch's doc comment for why the live
+     * row is unsafe to hand out directly. displayId, not modelId, is the key a sidecar override table
+     * should use -- see CreatureModelResolveArgs's doc comment in Event.hpp for why.
+     * @param record  EAX at kResolveMerge: the resolved CreatureModelData row pointer, or null.
+     * @return the EAX value the trampoline should resume with: the original live record pointer
+     *         unchanged if no subscriber touched ModelName, or g_creatureModelScratch's address if
+     *         one did -- the naked stub below writes this back into the pushad-saved EAX slot so
+     *         popad restores it, redirecting the caller's subsequent read without ever writing
+     *         through the real record pointer.
+     */
+    uint32_t __cdecl OnCreatureModelResolveMergeCaptured(void* record)
+    {
+        if (!record) return 0;
+
+        auto* realModelNameSlot =
+            reinterpret_cast<const char**>(static_cast<uint8_t*>(record) + db2::creaturemodeldata::kOffModelName);
+        const char* originalModelName = *realModelNameSlot;
+
+        std::memcpy(g_creatureModelScratch, record, sizeof(g_creatureModelScratch));
+
+        ev::CreatureModelResolveArgs a{ g_pendingCreatureDisplayId, *static_cast<uint32_t*>(record),
+                                         g_creatureModelScratch };
+        ev::Emit(ev::Event::OnCreatureModelResolve, &a);
+
+        auto* scratchModelNameSlot =
+            reinterpret_cast<const char**>(g_creatureModelScratch + db2::creaturemodeldata::kOffModelName);
+        if (*scratchModelNameSlot == originalModelName)
+            return reinterpret_cast<uint32_t>(record); // untouched -- resume with the real row, no redirect
+
+        return reinterpret_cast<uint32_t>(g_creatureModelScratch); // overridden -- resume reading from the copy
+    }
+
+    /**
+     * @brief Detours db2::creaturemodeldata::kResolveMerge directly (not a function boundary).
+     *
+     * Captures EAX exactly as it stands at that address, forwards it to
+     * OnCreatureModelResolveMergeCaptured() as a plain cdecl argument. That call returns the EAX
+     * value the rest of kResolveFn should see -- either the untouched real record pointer, or
+     * g_creatureModelScratch's address if a subscriber overrode ModelName (see that function's doc
+     * comment). The return value is written into the pushad-saved EAX slot (at [esp+28]: PUSHAD's
+     * stack layout, low-to-high address, is EDI/ESI/EBP/ESP_orig/EBX/EDX/ECX/EAX) BEFORE popad, so
+     * popad restores this value into EAX instead of whatever was there before the call -- this is
+     * what lets the C++ side redirect the register without the asm needing to know which case applies.
+     * Then jumps into the trampoline to run the original (overwritten) instruction and the rest of
+     * the containing function untouched -- same shape as hkUnitFieldSetWrite, see that for the
+     * general safety reasoning about hooking mid-function instead of at a function boundary.
+     */
+    __declspec(naked) void hkCreatureModelResolveMerge()
+    {
+        __asm
+        {
+            pushfd
+            pushad
+            push eax           ; record (1st and only cdecl arg)
+            call OnCreatureModelResolveMergeCaptured  ; returns the effective EAX in eax
+            add esp, 4
+            mov [esp+28], eax  ; overwrite the pushad-saved EAX slot so popad restores our value
+            popad
+            popfd
+            jmp g_origCreatureModelResolveMerge
+        }
+    }
+
+    /**
      * @brief Maps a raw update-field index to a weapon slot (0=mainhand, 1=offhand, 2=ranged).
      * @param fieldIndex  the edx value seen at kUnitFieldSetWrite.
      * @param slotOut     receives the mapped slot on a match.
@@ -1413,17 +1562,26 @@ namespace
     }
 
     /**
-     * @brief C++ side of the update-field write capture, called from the naked register-capture stub.
+     * @brief C++ side of the update-field write capture, called from the naked register-capture
+     *        stub at kUnitFieldSetWrite.
      *
      * Fires on EVERY field write for EVERY object (health, mana, auras, everything) -- the early
-     * ResolveWeaponVisualSlot() bail keeps this cheap for the overwhelming majority of calls that
-     * aren't weapon-visual fields.
+     * bail-outs below keep this cheap for the overwhelming majority of calls that aren't one of
+     * the handful of fields anything subscribes to.
      * @param fieldArrayBase  eax at the write instruction: the object's field array base.
      * @param fieldIndex      edx at the write instruction: which field.
      * @param value           ecx at the write instruction: the new value being committed.
      */
     void __cdecl OnUnitFieldSetCaptured(uint32_t fieldArrayBase, uint32_t fieldIndex, uint32_t value)
     {
+        if (fieldIndex == unit::kFieldUnitDisplayId || fieldIndex == unit::kFieldUnitNativeDisplayId)
+        {
+            void* unitPtr = reinterpret_cast<uint8_t*>(fieldArrayBase) - unit::kUnitFieldArrayOffset;
+            ev::CreatureDisplayChangeArgs a{ unitPtr, value, fieldIndex == unit::kFieldUnitNativeDisplayId };
+            ev::Emit(ev::Event::OnCreatureDisplayChange, &a);
+            return;
+        }
+
         uint32_t slot;
         if (!ResolveWeaponVisualSlot(fieldIndex, slot))
             return;
@@ -1687,6 +1845,17 @@ namespace wxl::runtime::game
         wxl::core::hook::Install("ItemDisplayInfoLookup", db2::itemdisplayinfo::kLookup,
                                  reinterpret_cast<void*>(&hkItemDisplayLookup),
                                  reinterpret_cast<void**>(&g_origItemDisplayLookup));
+        // Raw instruction hook, not a function boundary -- see kCaptureDisplayId's doc comment in
+        // DB2.hpp. Must be installed alongside CreatureModelResolveMerge below; the two work as a pair.
+        wxl::core::hook::Install("CreatureCaptureDisplayId", db2::creaturedisplayinfo::kCaptureDisplayId,
+                                 reinterpret_cast<void*>(&hkCreatureCaptureDisplayId),
+                                 reinterpret_cast<void**>(&g_origCreatureCaptureDisplayId));
+        // Raw instruction hook, not a function boundary -- see kResolveMerge's doc comment in
+        // DB2.hpp. Confirmed single call site (creaturemodeldata::kResolveFn has exactly one caller
+        // client-wide), so this covers every way a creature's model gets resolved.
+        wxl::core::hook::Install("CreatureModelResolveMerge", db2::creaturemodeldata::kResolveMerge,
+                                 reinterpret_cast<void*>(&hkCreatureModelResolveMerge),
+                                 reinterpret_cast<void**>(&g_origCreatureModelResolveMerge));
         // Raw instruction hook, not a function boundary -- see the comment on kUnitFieldSetWrite in
         // offsets/game/Unit.hpp. Uses the untyped Install() overload deliberately: hkUnitFieldSetWrite
         // is a naked register-capture stub, not a real C function, so it has no meaningful C++ type to
@@ -1712,7 +1881,7 @@ namespace wxl::runtime::game
             wxl::core::mem::Patch(reinterpret_cast<void*>(adt::kLiquidRowFlagTest), guard, sizeof guard);
         }
 
-        WLOG_INFO("game: hooks installed (M2BufferAlloc, M2BufferFree, M2Init, M2FinalizeSkin, M2SetupBatchAlpha, M2SortOpaqueGeoBatches, M2RenderBatchShadowMap, DoodadSpawn, TextureUpdate, TextureCreate, ChunkBuild, WmoRootComplete, WmoGroupParse, CWorldEnter, FramePump, ObjectUpdate, ObjectDestroy, TargetSet, PlaySound, PlaySoundKit, CharModelSlotDispatch, CharModelSlotClear, M2PerFrameUpdate, M2BuildBonePalette, ItemDisplayInfoLookup)");
+        WLOG_INFO("game: hooks installed (M2BufferAlloc, M2BufferFree, M2Init, M2FinalizeSkin, M2SetupBatchAlpha, M2SortOpaqueGeoBatches, M2RenderBatchShadowMap, DoodadSpawn, TextureUpdate, TextureCreate, ChunkBuild, WmoRootComplete, WmoGroupParse, CWorldEnter, FramePump, ObjectUpdate, ObjectDestroy, TargetSet, PlaySound, PlaySoundKit, CharModelSlotDispatch, CharModelSlotClear, M2PerFrameUpdate, M2BuildBonePalette, ItemDisplayInfoLookup, UnitFieldSetWrite, CreatureCaptureDisplayId, CreatureModelResolveMerge)");
     }
 
     uint32_t ItemDisplayInfoLookupNative(uint32_t displayId, void* outBuf)

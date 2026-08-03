@@ -72,6 +72,20 @@ namespace wxl::offsets::game::unit
     // convention, so this alias exists purely to type g_origUnitFieldSetWrite for the jmp thunk.
     using UnitFieldSetWriteFn = void(__cdecl*)();
 
+    // UNIT_FIELD_DISPLAYID's real update-field index. Confirmed directly (not inferred): captured
+    // during `.creature transform 33110` with edx=0x43 and ecx=0x8156
+    // (33110 decimal) landing in the same instruction hit -- ecx matching the exact displayId set
+    // is conclusive, not coincidental.
+    constexpr uint32_t kFieldUnitDisplayId = 0x43;
+    // UNIT_FIELD_NATIVEDISPLAYID, immediately after displayId. Not independently captured the same
+    // way (no write to this index was observed during a `.creature transform`, i.e. the command
+    // overrides the rendered model without touching what the unit "really" is underneath) -- this
+    // is the standard, well-documented 3.3.5a UpdateFields index, and the two sibling captures on
+    // either side of it (COMBATREACH=0x42 implied, DYNAMIC_FLAGS=0x4F, NPC_FLAGS=0x52 -- all three
+    // matched the public field table exactly in the same session) make it very likely correct, but
+    // treat it as one notch less certain than kFieldUnitDisplayId until it's actually seen fire.
+    constexpr uint32_t kFieldUnitNativeDisplayId = 0x44;
+
     // Update-field indices for the three weapon-category visible-item entry fields (WotLK 3.3.5a client,
     // build matching this offsets table). Verified empirically: each fires with ecx == the newly equipped
     // item's entry ID. Believed to be PLAYER_VISIBLE_ITEM_{1,2,3}_ENTRYID; each is presumably followed by

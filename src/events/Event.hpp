@@ -61,6 +61,10 @@ namespace wxl::events
                               // (WeaponVisualChangeArgs)
         OnItemDisplayLookup, // a native ItemDisplayInfo row lookup by id just succeeded
                               // (ItemDisplayLookupArgs)
+        OnCreatureDisplayChange, // UNIT_FIELD_DISPLAYID was committed for some object
+                              // (CreatureDisplayChangeArgs)
+        OnCreatureModelResolve, // a CreatureModelData row was resolved while rebuilding a creature's
+                              // visible model (CreatureModelResolveArgs)
         OnWorldEnter,    // the world/map finished loading, in-world   (WorldEnterArgs)
         OnWorldLeave,    // the world/map is being torn down           (WorldLeaveArgs)
         OnBeforeHostLaunch, // the DLL is about to launch the asset host (HostLaunchArgs)
@@ -222,6 +226,44 @@ namespace wxl::events
      *        path -- before the lookup's original caller reads them.
      */
     struct ItemDisplayLookupArgs { uint32_t displayId; void* record; };
+    /**
+     * @brief Args for OnCreatureDisplayChange; fires when UNIT_FIELD_DISPLAYID or
+     *        UNIT_FIELD_NATIVEDISPLAYID is committed for any unit (see unit::kFieldUnitDisplayId /
+     *        kFieldUnitNativeDisplayId in offsets/game/Unit.hpp) -- covers `.creature transform`,
+     *        any other server-driven display change, and (unconfirmed) possibly players too, since
+     *        these are generic per-object fields, not creature-specific at the engine level. unit
+     *        is the object whose field array the write landed in (unit_ptr = fieldArrayBase -
+     *        kUnitFieldArrayOffset, same derivation as WeaponVisualChangeArgs); displayId is the
+     *        newly committed value; native is true when this came from NATIVEDISPLAYID rather than
+     *        the rendered DISPLAYID field -- a subscriber only interested in what's actually drawn
+     *        should ignore native==true events.
+     */
+    struct CreatureDisplayChangeArgs { void* unit; uint32_t displayId; bool native; };
+    /**
+     * @brief Args for OnCreatureModelResolve; fires whenever the client resolves a CreatureModelData
+     *        row while building/rebuilding a creature's visible model (see
+     *        db2::creaturemodeldata::kResolveMerge in offsets/game/DB2.hpp) -- covers every way a
+     *        creature's model gets resolved, confirmed to be the single, centralized choke point via
+     *        "find references" (one call site client-wide). displayId is captured one step earlier,
+     *        at creaturedisplayinfo::kCaptureDisplayId, and carried forward -- it is the key you want
+     *        for a sidecar override table, NOT modelId: several CreatureDisplayInfo rows (different
+     *        texture-variant recolors of one creature) commonly share a single ModelId, so a
+     *        modelId-keyed override can't tell them apart, while displayId can. modelId comes from the
+     *        CreatureModelData row itself (0 if the ModelId lookup failed -- subscribers should check
+     *        record before touching it).
+     *
+     *        IMPORTANT: unlike ItemDisplayLookupArgs::record (a caller-owned stack copy -- see
+     *        ItemDisplayInfo::kLookup's doc comment in DB2.hpp), record here is NEVER the live,
+     *        shared db2::creaturemodeldata::kIdTable row -- it is a private scratch copy the emitter
+     *        (GameHooks.cpp's OnCreatureModelResolveMergeCaptured) makes specifically so subscribers
+     *        have somewhere safe to write. A subscriber may freely overwrite record's ModelName field
+     *        (creaturemodeldata::kOffModelName) in place with a virtual path; the emitter detects the
+     *        change and redirects the resolve to it without ever touching the real table row.
+     *        Writing ModelName on the real row used to be the documented pattern here and was a bug:
+     *        several displayIds sharing one ModelId would permanently corrupt each other's ModelName
+     *        for the rest of the process, since the "live" row is shared and persistent, not per-call.
+     */
+    struct CreatureModelResolveArgs { uint32_t displayId; uint32_t modelId; void* record; };
     /** @brief Args for OnM2PerFrameUpdate; renderCtx is the per-instance render context that the
      *         scene graph is updating — fires once per visible M2 instance per frame. */
     struct M2PerFrameUpdateArgs { void* renderCtx; };

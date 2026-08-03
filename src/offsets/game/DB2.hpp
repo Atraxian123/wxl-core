@@ -116,4 +116,83 @@ namespace wxl::offsets::game::db2
     {
         constexpr uintptr_t kTable = 0x00AC46A0; // char*[2] (index 0 = "Male", index 1 = "Female")
     }
+
+    // -------------------------------------------------------------------------
+    // CreatureDisplayInfo DBC. Range-checked + array-indexed inline (no separate funnel function like
+    // ItemDisplayInfo's kLookup -- this table's lookup is inlined directly into its one caller,
+    // creaturemodeldata::kResolveFn below; see that namespace for the second, chained lookup the same
+    // function does). RE'd via live read/write tracing while running `.creature transform`, confirmed
+    // against a real sample row (displayId 33110 / 0x8156): ModelId read back as 7284 / 0x1C74 exactly,
+    // and TextureVariation1/2/3 read back as real creature texture-variant names (e.g.
+    // "manawyrm2_void"), confirming both the record layout and the field offsets below.
+    // -------------------------------------------------------------------------
+    namespace creaturedisplayinfo
+    {
+        constexpr uintptr_t kMinId   = 0x00AD34C8; // i32
+        constexpr uintptr_t kMaxId   = 0x00AD34C4; // i32
+        constexpr uintptr_t kIdTable = 0x00AD34D8; // record* table, indexed by (id - minId)
+
+        constexpr size_t kOffModelId           = 0x04; // uint32 -- FK into CreatureModelData, NOT a string
+        constexpr size_t kOffTextureVariation1 = 0x18; // char*
+        constexpr size_t kOffTextureVariation2 = 0x1C; // char*
+        constexpr size_t kOffTextureVariation3 = 0x20; // char*
+
+        // kCaptureDisplayId is NOT a function boundary -- it is the raw instruction address reached
+        // immediately after the inline CreatureDisplayInfo lookup succeeds, inside
+        // creaturemodeldata::kResolveFn (single predecessor: only the `jne` guarding the lookup's
+        // success path reaches this exact address, so nothing branches into the middle of the
+        // overwritten bytes). ESI at this address holds the displayId that was just resolved -- the
+        // ONLY point in kResolveFn where displayId is still live, since it goes out of scope
+        // afterward in favor of ModelId. This exists purely to carry displayId forward to
+        // creaturemodeldata::kResolveMerge, which fires later in the SAME call and needs it to key a
+        // per-displayId model-path override rather than a per-ModelId one (several displayIds
+        // commonly share one ModelId, e.g. texture-variant recolors of one creature, so a
+        // ModelId-keyed override can't tell them apart -- see OnCreatureModelResolve's doc comment
+        // in Event.hpp). Relies on kResolveFn executing synchronously, single-threaded, start to
+        // finish with no reentrancy between this hook and kResolveMerge -- true given the confirmed
+        // single call site, but worth remembering if that calling pattern is ever revisited.
+        constexpr uintptr_t kCaptureDisplayId = 0x0072A4F3;
+        using CaptureDisplayIdFn = void(__cdecl*)();
+    }
+
+    // -------------------------------------------------------------------------
+    // CreatureModelData DBC. Keyed by ModelId (creaturedisplayinfo::kOffModelId's value), NOT by
+    // displayId -- several CreatureDisplayInfo rows (different texture variants of one creature)
+    // commonly share a single ModelId, so a ModelId-keyed model-path override naturally covers every
+    // variant with one registration. Same inline range-check + array-index lookup shape as
+    // creaturedisplayinfo above, chained immediately after it inside kResolveFn. Confirmed via live
+    // memory dump: row+0 read back as the row's own id (0x1C74 = 7284, matched exactly), row+8
+    // pointed at the string "Creature\ManaWyrm2\ManaWyrm2.mdx" -- a real, well-formed archive path.
+    // -------------------------------------------------------------------------
+    namespace creaturemodeldata
+    {
+        constexpr uintptr_t kMinId   = 0x00AD3510; // i32
+        constexpr uintptr_t kMaxId   = 0x00AD350C; // i32
+        constexpr uintptr_t kIdTable = 0x00AD3520; // record* table, indexed by (id - minId)
+
+        constexpr size_t kOffId        = 0x00; // uint32, row's own id (== ModelId)
+        constexpr size_t kOffModelName = 0x08; // char* -- the field to substitute for a virtual path
+
+        // kResolveMerge is NOT a function boundary -- it is the raw instruction address immediately
+        // after the inline CreatureModelData lookup completes, inside kResolveFn. Both the
+        // lookup-succeeded and lookup-failed branches jump to this exact address (it's a genuine merge
+        // point in the control flow, not a mid-instruction landing), so nothing branches into the
+        // middle of whatever bytes get overwritten there -- same safety justification as
+        // unit::kUnitFieldSetWrite in Unit.hpp. EAX at this address holds the resolved
+        // CreatureModelData row pointer, or 0 if ModelId was out of range -- check for null before
+        // touching kOffModelName.
+        constexpr uintptr_t kResolveMerge = 0x0072A531;
+        // Raw instruction hook, not a real function boundary -- see kResolveMerge's doc comment
+        // above. __cdecl() with no params/return: the naked hook stub reads eax manually rather
+        // than through the calling convention, so this alias exists purely to type
+        // g_origResolveMerge for the jmp thunk (same convention as unit::UnitFieldSetWrite2Fn).
+        using ResolveMergeFn = void(__cdecl*)();
+        // kResolveFn is this hook's containing function's real entry point (confirmed prologue:
+        // push esi / push edi / mov edi,ecx / mov esi,[edi+9D4]). Confirmed via "find references to"
+        // that this is the ONLY call site anywhere in the client that reaches this resolution path
+        // (one caller, sub_73E410 at 0x0073E410) -- so a hook at kResolveMerge covers every way a
+        // creature's model gets resolved, with no other path to miss. Recorded for reference/logging
+        // only; kResolveFn itself is not a hook point the way kResolveMerge is.
+        constexpr uintptr_t kResolveFn = 0x0072A480;
+    }
 }
